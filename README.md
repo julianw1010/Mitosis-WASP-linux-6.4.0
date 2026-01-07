@@ -286,4 +286,4 @@ GPL-2.0 (as part of the Linux kernel)
 
 ## AI attestation
 
-This code was developed with AI assistance. For a full protocol containing the implementation of Mitosis and WASP, see [here](https://github.com/julianw1010/thesis-protocol).
+This code was developed with AI assistance. For a full protocol containing the implementation assistance during the development of Mitosis and WASP, see [here](https://github.com/julianw1010/thesis-protocol).
