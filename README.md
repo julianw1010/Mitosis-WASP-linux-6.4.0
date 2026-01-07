@@ -239,46 +239,6 @@ Historical records of completed replication sessions with:
 
 This implementation disables PCID (Process Context ID) and INVPCID to ensure TLB flushes occur on every CR3 write. This is necessary for correctness when switching between replicas.
 
-## Troubleshooting
-
-### Replication Won't Enable
-
-```bash
-
-# Check NUMA topology
-numactl --hardware
-
-# Verify kernel config
-zcat /proc/config.gz | grep PGTABLE_REPLICATION
-```
-
-### Performance Not Improved
-
-1. Verify replicas are being used:
-   ```bash
-   cat /proc/mitosis/status | grep "Replica hit rate"
-   ```
-
-2. Check steering configuration:
-   ```bash
-   # Ensure auto-steering (-1) or correct manual steering
-   ```
-
-3. Verify workload is NUMA-distributed:
-   ```bash
-   numastat -p <pid>
-   ```
-
-### High Memory Usage
-
-1. Check replica counts:
-   ```bash
-   cat /proc/mitosis/active
-   cat /proc/mitosis/history
-   ```
-
-2. Consider reducing replicated nodes or disabling for low-priority processes.
-
 ## API Reference
 
 ### Kernel Functions
@@ -323,3 +283,7 @@ GPL-2.0 (as part of the Linux kernel)
 
 - Kernel Base: Linux 6.4
 - Extraversion: `-wasp`
+
+## AI attestation
+
+This code was developed with AI assistance. For a full protocol containing the implementation of Mitosis and WASP, see [here](https://github.com/julianw1010/thesis-protocol).
