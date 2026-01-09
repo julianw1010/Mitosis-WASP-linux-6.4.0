@@ -298,6 +298,8 @@ struct prctl_mm_map {
 /* PGD replication control */
 #define PR_SET_PGTABLE_REPL		100
 #define PR_GET_PGTABLE_REPL		101
+#define PR_SET_PGTABLE_CACHE_ONLY	102
+#define PR_GET_PGTABLE_CACHE_ONLY	103
 #define PR_SET_PGTABLE_REPL_STEERING	104
 #define PR_GET_PGTABLE_REPL_STEERING	105
 

@@ -614,6 +614,7 @@ struct mm_struct {
 		bool repl_pgd_enabled;           /* Is replication active for this mm? */
 		bool repl_in_progress;           /* Replication operation in progress */
 		bool repl_pending_enable;        /* Pending enable after exec */
+                bool cache_only_mode;            /* Use page table cache without replication */
 		nodemask_t repl_pgd_nodes;       /* Which nodes have replicas */
 		nodemask_t repl_pending_nodes;   /* Nodes to enable after exec */
 		struct mutex repl_mutex;         /* Protects replication state */

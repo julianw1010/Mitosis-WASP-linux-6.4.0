@@ -1542,6 +1542,11 @@ static struct linux_binprm *alloc_bprm(int fd, struct filename *filename)
 		goto out_free;
 		
 #ifdef CONFIG_PGTABLE_REPLICATION
+	/* Inherit cache_only_mode from parent */
+	if (current->mm) {
+		bprm->mm->cache_only_mode = current->mm->cache_only_mode;
+	}
+
 	/* Mark for deferred enable after mm is fully active */
 	if (current->mm && current->mm->repl_pgd_enabled &&
 	    !nodes_empty(current->mm->repl_pgd_nodes)) {

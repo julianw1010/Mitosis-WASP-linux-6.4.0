@@ -2847,6 +2847,102 @@ case PR_SET_PGTABLE_REPL:
 		}
 		break;
 	}
+	case PR_SET_PGTABLE_CACHE_ONLY:
+	{
+		struct mm_struct *mm = NULL;
+		struct task_struct *task = NULL;
+		pid_t target_pid = (pid_t)arg3;
+		bool is_self = (target_pid == 0);
+		bool enable = (arg2 != 0);
+
+		/* Get target task */
+		if (!is_self) {
+			rcu_read_lock();
+			task = find_task_by_vpid(target_pid);
+			if (task)
+				get_task_struct(task);
+			rcu_read_unlock();
+
+			if (!task) {
+				error = -ESRCH;
+				break;
+			}
+
+			mm = get_task_mm(task);
+		} else {
+			task = current;
+			mm = current->mm;
+			if (mm)
+				mmget(mm);
+		}
+
+		if (!mm) {
+			if (!is_self && task)
+				put_task_struct(task);
+			error = -EINVAL;
+			break;
+		}
+
+		/* Cannot enable cache-only mode if full replication is active */
+		if (enable && smp_load_acquire(&mm->repl_pgd_enabled)) {
+			error = -EBUSY;
+			mmput(mm);
+			if (!is_self && task)
+				put_task_struct(task);
+			break;
+		}
+
+		WRITE_ONCE(mm->cache_only_mode, enable);
+		error = 0;
+
+		mmput(mm);
+		if (!is_self && task)
+			put_task_struct(task);
+		break;
+	}
+
+	case PR_GET_PGTABLE_CACHE_ONLY:
+	{
+		struct mm_struct *mm = NULL;
+		struct task_struct *task = NULL;
+		pid_t target_pid = (pid_t)arg2;
+		bool is_self = (target_pid == 0);
+
+		/* Get target task */
+		if (!is_self) {
+			rcu_read_lock();
+			task = find_task_by_vpid(target_pid);
+			if (task)
+				get_task_struct(task);
+			rcu_read_unlock();
+
+			if (!task) {
+				error = -ESRCH;
+				break;
+			}
+
+			mm = get_task_mm(task);
+		} else {
+			task = current;
+			mm = current->mm;
+			if (mm)
+				mmget(mm);
+		}
+
+		if (!mm) {
+			if (!is_self && task)
+				put_task_struct(task);
+			error = -EINVAL;
+			break;
+		}
+
+		error = READ_ONCE(mm->cache_only_mode) ? 1 : 0;
+
+		mmput(mm);
+		if (!is_self && task)
+			put_task_struct(task);
+		break;
+	}
 	case PR_SET_PGTABLE_REPL_STEERING:
 	{
 		struct mm_struct *mm = NULL;

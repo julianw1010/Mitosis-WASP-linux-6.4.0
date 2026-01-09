@@ -1302,6 +1302,7 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
 	mm->repl_pgd_enabled = false;
 	mm->repl_in_progress = false;
 	mm->repl_pending_enable = false;
+	mm->cache_only_mode = false;
 	nodes_clear(mm->repl_pgd_nodes);
 	nodes_clear(mm->repl_pending_nodes);
 	mutex_init(&mm->repl_mutex);
@@ -1747,6 +1748,7 @@ static struct mm_struct *dup_mm(struct task_struct *tsk,
 	mm->repl_pgd_enabled = false;
 	mm->repl_in_progress = false;
 	mm->repl_pending_enable = false;
+	mm->cache_only_mode = oldmm->cache_only_mode;
 	nodes_clear(mm->repl_pgd_nodes);
 	nodes_clear(mm->repl_pending_nodes);
 	mutex_init(&mm->repl_mutex);
