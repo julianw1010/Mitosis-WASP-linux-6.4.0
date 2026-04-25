@@ -19,6 +19,8 @@
 #include <asm/apic.h>
 #include <asm/perf_event.h>
 
+#include <asm/pgtable_repl.h>
+
 #include "mm_internal.h"
 
 #ifdef CONFIG_PARAVIRT
@@ -502,6 +504,57 @@ void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
 	u64 next_tlb_gen;
 	bool need_flush;
 	u16 new_asid;
+	pgd_t *pgd_to_use;
+
+	bool using_replica = false;
+	bool rcu_held = false;
+	int local_node;
+	int target_node;
+	bool repl_enabled;
+	bool repl_in_progress;
+	pgd_t *selected_replica = NULL;
+
+	local_node = numa_node_id();
+
+	rcu_read_lock();
+	rcu_held = true;
+
+	repl_enabled = smp_load_acquire(&next->repl_pgd_enabled);
+	pgd_to_use = next->pgd;
+
+	if (repl_enabled) {
+		repl_in_progress = smp_load_acquire(&next->repl_in_progress);
+
+		if (!repl_in_progress) {
+			pgd_t *node_pgd;
+			int steered_node;
+
+			steered_node = READ_ONCE(next->repl_steering[local_node]);
+			if (steered_node >= 0 && steered_node < MAX_NUMNODES) {
+				target_node = steered_node;
+			} else {
+				target_node = local_node;
+			}
+
+			node_pgd = READ_ONCE(next->pgd_replicas[target_node]);
+
+			if (node_pgd && virt_addr_valid(node_pgd)) {
+				if (smp_load_acquire(&next->repl_pgd_enabled) &&
+				    !smp_load_acquire(&next->repl_in_progress)) {
+					struct page *pgd_page = virt_to_page(node_pgd);
+
+					if (pgd_page && page_to_nid(pgd_page) == target_node) {
+						unsigned long pa = __pa(node_pgd);
+						if (pa && pfn_valid(pa >> PAGE_SHIFT)) {
+							selected_replica = node_pgd;
+							pgd_to_use = node_pgd;
+							using_replica = (node_pgd != next->pgd);
+						}
+					}
+				}
+			}
+		}
+	}
 
 	/*
 	 * NB: The scheduler will call us with prev == next when switching
@@ -525,6 +578,7 @@ void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
 	 * Only do this check if CONFIG_DEBUG_VM=y because __read_cr3()
 	 * isn't free.
 	 */
+#if 0
 #ifdef CONFIG_DEBUG_VM
 	if (WARN_ON_ONCE(__read_cr3() != build_cr3(real_prev->pgd, prev_asid,
 						   tlbstate_lam_cr3_mask()))) {
@@ -543,6 +597,8 @@ void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
 		__flush_tlb_all();
 	}
 #endif
+#endif
+
 	if (was_lazy)
 		this_cpu_write(cpu_tlbstate_shared.is_lazy, false);
 
@@ -577,13 +633,48 @@ void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
 				 !cpumask_test_cpu(cpu, mm_cpumask(next))))
 			cpumask_set_cpu(cpu, mm_cpumask(next));
 
+		if (selected_replica) {
+			unsigned long current_cr3_pa = __read_cr3() & PAGE_MASK;
+			unsigned long target_cr3_pa = __pa(selected_replica);
+
+			if (current_cr3_pa != target_cr3_pa) {
+				if (smp_load_acquire(&next->repl_pgd_enabled) &&
+				    !smp_load_acquire(&next->repl_in_progress)) {
+					unsigned long new_cr3 = target_cr3_pa | (__read_cr3() & ~PAGE_MASK);
+
+					native_write_cr3(new_cr3);
+					__flush_tlb_all();
+				}
+
+				rcu_read_unlock();
+				rcu_held = false;
+				return;
+			}
+		} else if (repl_enabled) {
+			unsigned long current_cr3_pa = __read_cr3() & PAGE_MASK;
+			unsigned long primary_cr3_pa = __pa(next->pgd);
+
+			if (current_cr3_pa != primary_cr3_pa) {
+				unsigned long new_cr3 = primary_cr3_pa | (__read_cr3() & ~PAGE_MASK);
+				native_write_cr3(new_cr3);
+				__flush_tlb_all();
+
+				rcu_read_unlock();
+				rcu_held = false;
+				return;
+			}
+		}
+
 		/*
 		 * If the CPU is not in lazy TLB mode, we are just switching
 		 * from one thread in a process to another thread in the same
 		 * process. No TLB flush required.
 		 */
-		if (!was_lazy)
+		if (!was_lazy) {
+			if (rcu_held)
+				rcu_read_unlock();
 			return;
+		}
 
 		/*
 		 * Read the tlb_gen to check whether a flush is needed.
@@ -594,8 +685,11 @@ void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
 		smp_mb();
 		next_tlb_gen = atomic64_read(&next->context.tlb_gen);
 		if (this_cpu_read(cpu_tlbstate.ctxs[prev_asid].tlb_gen) ==
-				next_tlb_gen)
+				next_tlb_gen) {
+			if (rcu_held)
+				rcu_read_unlock();
 			return;
+		}
 
 		/*
 		 * TLB contents went out of date while we were in lazy
@@ -635,17 +729,24 @@ void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
 		barrier();
 	}
 
+	if (selected_replica) {
+		if (!smp_load_acquire(&next->repl_pgd_enabled) ||
+		    smp_load_acquire(&next->repl_in_progress)) {
+			pgd_to_use = next->pgd;
+			using_replica = false;
+			selected_replica = NULL;
+		}
+	}
+
 	set_tlbstate_lam_mode(next);
 	if (need_flush) {
 		this_cpu_write(cpu_tlbstate.ctxs[new_asid].ctx_id, next->context.ctx_id);
 		this_cpu_write(cpu_tlbstate.ctxs[new_asid].tlb_gen, next_tlb_gen);
-		load_new_mm_cr3(next->pgd, new_asid, new_lam, true);
-
+		load_new_mm_cr3(pgd_to_use, new_asid, new_lam, true);
 		trace_tlb_flush(TLB_FLUSH_ON_TASK_SWITCH, TLB_FLUSH_ALL);
 	} else {
 		/* The new ASID is already up to date. */
-		load_new_mm_cr3(next->pgd, new_asid, new_lam, false);
-
+		load_new_mm_cr3(pgd_to_use, new_asid, new_lam, false);
 		trace_tlb_flush(TLB_FLUSH_ON_TASK_SWITCH, 0);
 	}
 
@@ -654,6 +755,9 @@ void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
 
 	this_cpu_write(cpu_tlbstate.loaded_mm, next);
 	this_cpu_write(cpu_tlbstate.loaded_mm_asid, new_asid);
+
+	if (rcu_held)
+		rcu_read_unlock();
 
 	if (next != real_prev) {
 		cr4_update_pce_mm(next);
@@ -766,12 +870,14 @@ static void flush_tlb_func(void *info)
 		count_vm_tlb_event(NR_TLB_REMOTE_FLUSH_RECEIVED);
 
 		/* Can only happen on remote CPUs */
-		if (f->mm && f->mm != loaded_mm)
+		if (f->mm && f->mm != loaded_mm) {
 			return;
+		}
 	}
 
-	if (unlikely(loaded_mm == &init_mm))
+	if (unlikely(loaded_mm == &init_mm)) {
 		return;
+	}
 
 	VM_WARN_ON(this_cpu_read(cpu_tlbstate.ctxs[loaded_mm_asid].ctx_id) !=
 		   loaded_mm->context.ctx_id);
@@ -1020,6 +1126,7 @@ void flush_tlb_mm_range(struct mm_struct *mm, unsigned long start,
 	info = get_flush_tlb_info(mm, start, end, stride_shift, freed_tables,
 				  new_tlb_gen);
 
+
 	/*
 	 * flush_tlb_multi() is not optimized for the common case in which only
 	 * a local TLB flush is needed. Optimize this use-case by calling
@@ -1035,6 +1142,7 @@ void flush_tlb_mm_range(struct mm_struct *mm, unsigned long start,
 	}
 
 	put_flush_tlb_info();
+	mitosis_drain_deferred_pages(mm);
 	put_cpu();
 }
 

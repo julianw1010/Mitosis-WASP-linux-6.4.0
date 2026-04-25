@@ -19,8 +19,11 @@
 #include <linux/workqueue.h>
 #include <linux/seqlock.h>
 #include <linux/percpu_counter.h>
+#include <linux/nodemask.h>
 
 #include <asm/mmu.h>
+
+#include <linux/ktime.h>
 
 #ifndef AT_VECTOR_SIZE_ARCH
 #define AT_VECTOR_SIZE_ARCH 0
@@ -69,6 +72,12 @@ struct mem_cgroup;
 #define _struct_page_alignment	__aligned(2 * sizeof(unsigned long))
 #else
 #define _struct_page_alignment	__aligned(sizeof(unsigned long))
+#endif
+
+#ifdef CONFIG_MITOSIS_NUMA_NODE_COUNT
+#define NUMA_NODE_COUNT CONFIG_MITOSIS_NUMA_NODE_COUNT
+#else
+#error "CONFIG_MITOSIS_NUMA_NODE_COUNT is not defined. Enable MITOSIS_NUMA_NODE_COUNT in Kconfig."
 #endif
 
 struct page {
@@ -228,6 +237,9 @@ struct page {
 #ifdef LAST_CPUPID_NOT_IN_PAGE_FLAGS
 	int _last_cpupid;
 #endif
+
+            struct page *pt_replica;
+            struct mm_struct *pt_owner_mm;
 } _struct_page_alignment;
 
 /*
@@ -597,6 +609,24 @@ struct mm_struct {
 		unsigned long mmap_compat_legacy_base;
 #endif
 		unsigned long task_size;	/* size of task vm space */
+
+                bool repl_pgd_enabled;
+		bool repl_in_progress;
+		bool repl_pending_enable;
+		bool cache_only_mode;
+		nodemask_t repl_pgd_nodes;
+		nodemask_t repl_pending_nodes;
+		struct mutex repl_mutex;
+		spinlock_t repl_alloc_lock;
+		spinlock_t mitosis_deferred_lock;
+		struct page *mitosis_deferred_pages;
+		pgd_t *pgd_replicas[NUMA_NODE_COUNT];
+		pgd_t *original_pgd;
+		int repl_steering[NUMA_NODE_COUNT];
+
+		atomic_t pgtable_interleave_counter;
+		
+		
 		pgd_t * pgd;
 
 #ifdef CONFIG_MEMBARRIER

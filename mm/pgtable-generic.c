@@ -13,6 +13,8 @@
 #include <linux/mm_inline.h>
 #include <asm/tlb.h>
 
+#include <asm/pgtable_repl.h>
+
 /*
  * If a p?d_bad entry is found while walking page tables, report
  * the error, before resetting entry to p?d_none.  Usually (but

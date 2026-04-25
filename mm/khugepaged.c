@@ -1223,6 +1223,7 @@ static int collapse_huge_page(struct mm_struct *mm, unsigned long address,
 	spin_unlock(pmd_ptl);
 
 	hpage = NULL;
+	
 
 	result = SCAN_SUCCEED;
 out_up_write:

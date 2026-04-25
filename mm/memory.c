@@ -91,6 +91,8 @@
 #include "internal.h"
 #include "swap.h"
 
+#include <asm/pgtable_repl.h>
+
 #if defined(LAST_CPUPID_NOT_IN_PAGE_FLAGS) && !defined(CONFIG_COMPILE_TEST)
 #warning Unfortunate NUMA and NUMA Balancing config, growing page-frame for last_cpupid.
 #endif
@@ -5015,7 +5017,6 @@ static vm_fault_t __handle_mm_fault(struct vm_area_struct *vma,
 	p4d = p4d_alloc(mm, pgd, address);
 	if (!p4d)
 		return VM_FAULT_OOM;
-
 	vmf.pud = pud_alloc(mm, p4d, address);
 	if (!vmf.pud)
 		return VM_FAULT_OOM;
@@ -5027,10 +5028,8 @@ retry_pud:
 			return ret;
 	} else {
 		pud_t orig_pud = *vmf.pud;
-
 		barrier();
 		if (pud_trans_huge(orig_pud) || pud_devmap(orig_pud)) {
-
 			/*
 			 * TODO once we support anonymous PUDs: NUMA case and
 			 * FAULT_FLAG_UNSHARE handling.
@@ -5045,23 +5044,19 @@ retry_pud:
 			}
 		}
 	}
-
 	vmf.pmd = pmd_alloc(mm, vmf.pud, address);
 	if (!vmf.pmd)
 		return VM_FAULT_OOM;
-
 	/* Huge pud page fault raced with pmd_alloc? */
 	if (pud_trans_unstable(vmf.pud))
 		goto retry_pud;
-
 	if (pmd_none(*vmf.pmd) &&
 	    hugepage_vma_check(vma, vm_flags, false, true, true)) {
 		ret = create_huge_pmd(&vmf);
 		if (!(ret & VM_FAULT_FALLBACK))
 			return ret;
 	} else {
-		vmf.orig_pmd = *vmf.pmd;
-
+		vmf.orig_pmd = pmdp_get_lockless(vmf.pmd);
 		barrier();
 		if (unlikely(is_swap_pmd(vmf.orig_pmd))) {
 			VM_BUG_ON(thp_migration_supported() &&
@@ -5073,7 +5068,6 @@ retry_pud:
 		if (pmd_trans_huge(vmf.orig_pmd) || pmd_devmap(vmf.orig_pmd)) {
 			if (pmd_protnone(vmf.orig_pmd) && vma_is_accessible(vma))
 				return do_huge_pmd_numa_page(&vmf);
-
 			if ((flags & (FAULT_FLAG_WRITE|FAULT_FLAG_UNSHARE)) &&
 			    !pmd_write(vmf.orig_pmd)) {
 				ret = wp_huge_pmd(&vmf);
@@ -5085,8 +5079,7 @@ retry_pud:
 			}
 		}
 	}
-
-	return handle_pte_fault(&vmf);
+        return handle_pte_fault(&vmf);
 }
 
 /**
@@ -5241,6 +5234,10 @@ vm_fault_t handle_mm_fault(struct vm_area_struct *vma, unsigned long address,
 		ret = hugetlb_fault(vma->vm_mm, vma, address, flags);
 	else
 		ret = __handle_mm_fault(vma, address, flags);
+
+	if (smp_load_acquire(&vma->vm_mm->repl_pgd_enabled) &&
+		!(ret & (VM_FAULT_ERROR | VM_FAULT_RETRY)))
+		mitosis_verify_fault_walk(vma->vm_mm, address);
 
 	lru_gen_exit_fault();
 

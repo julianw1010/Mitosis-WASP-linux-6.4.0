@@ -6,6 +6,8 @@
 #include <linux/mm.h>		/* for struct page */
 #include <linux/pagemap.h>
 
+#include <asm/pgtable_repl.h>
+
 #define __HAVE_ARCH_PTE_ALLOC_ONE
 #define __HAVE_ARCH_PGD_FREE
 #include <asm-generic/pgalloc.h>
@@ -74,6 +76,15 @@ static inline void pmd_populate_kernel_safe(struct mm_struct *mm,
 	paravirt_alloc_pte(mm, __pa(pte) >> PAGE_SHIFT);
 	set_pmd_safe(pmd, __pmd(__pa(pte) | _PAGE_TABLE));
 }
+
+static inline void pmd_populate_no_rep(struct mm_struct *mm, pmd_t *pmd,
+				       struct page *pte)
+{
+	unsigned long pfn = page_to_pfn(pte);
+
+	native_set_pmd(pmd, __pmd(((pteval_t)pfn << PAGE_SHIFT) | _PAGE_TABLE));
+}
+
 
 static inline void pmd_populate(struct mm_struct *mm, pmd_t *pmd,
 				struct page *pte)
@@ -149,20 +160,51 @@ static inline void pgd_populate_safe(struct mm_struct *mm, pgd_t *pgd, p4d_t *p4
 
 static inline p4d_t *p4d_alloc_one(struct mm_struct *mm, unsigned long addr)
 {
-	gfp_t gfp = GFP_KERNEL_ACCOUNT;
+    gfp_t gfp = GFP_KERNEL_ACCOUNT;
+    struct page *page;
 
-	if (mm == &init_mm)
-		gfp &= ~__GFP_ACCOUNT;
-	return (p4d_t *)get_zeroed_page(gfp);
+    if (mm == &init_mm)
+        gfp &= ~__GFP_ACCOUNT;
+
+    if (mitosis_active(mm)) {
+        page = mitosis_alloc_primary(mm, gfp | __GFP_ZERO, 0, MITOSIS_CACHE_P4D);
+        if (!page)
+            return NULL;
+        page->pt_owner_mm = mm;
+        return (p4d_t *)page_address(page);
+    }
+
+    page = alloc_pages(gfp | __GFP_ZERO, 0);
+    if (!page)
+        return NULL;
+    page->pt_owner_mm = mm;
+    return (p4d_t *)page_address(page);
 }
 
 static inline void p4d_free(struct mm_struct *mm, p4d_t *p4d)
 {
-	if (!pgtable_l5_enabled())
-		return;
+    struct page *page;
+    int nid;
+    bool from_cache;
 
-	BUG_ON((unsigned long)p4d & (PAGE_SIZE-1));
-	free_page((unsigned long)p4d);
+    if (!pgtable_l5_enabled())
+        return;
+
+    BUG_ON((unsigned long)p4d & (PAGE_SIZE-1));
+    page = virt_to_page(p4d);
+    nid = page_to_nid(page);
+    from_cache = PageMitosisFromCache(page);
+
+    page->pt_owner_mm = NULL;
+
+    if (from_cache) {
+        ClearPageMitosisFromCache(page);
+        page->pt_replica = NULL;
+        if (mitosis_cache_push(page, nid, MITOSIS_CACHE_P4D))
+            return;
+    }
+    ClearPageMitosisFromCache(page);
+    free_page((unsigned long)p4d);
 }
 
 extern void ___p4d_free_tlb(struct mmu_gather *tlb, p4d_t *p4d);

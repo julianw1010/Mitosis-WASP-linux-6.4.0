@@ -46,6 +46,10 @@
 #define CREATE_TRACE_POINTS
 #include <trace/events/thp.h>
 
+#include <asm/pgalloc.h>
+
+#include <asm/pgtable_repl.h>
+
 /*
  * By default, transparent hugepage support is disabled in order to avoid
  * risking an increased memory footprint for applications that are not
@@ -1016,7 +1020,7 @@ static void touch_pmd(struct vm_area_struct *vma, unsigned long addr,
 {
 	pmd_t _pmd;
 
-	_pmd = pmd_mkyoung(*pmd);
+	_pmd = pmd_mkyoung(pgtable_repl_get_pmd(pmd));
 	if (write)
 		_pmd = pmd_mkdirty(_pmd);
 	if (pmdp_set_access_flags(vma, addr & HPAGE_PMD_MASK,
@@ -1087,7 +1091,7 @@ int copy_huge_pmd(struct mm_struct *dst_mm, struct mm_struct *src_mm,
 	spin_lock_nested(src_ptl, SINGLE_DEPTH_NESTING);
 
 	ret = -EAGAIN;
-	pmd = *src_pmd;
+	pmd = pgtable_repl_get_pmd(src_pmd);
 
 #ifdef CONFIG_ARCH_ENABLE_THP_MIGRATION
 	if (unlikely(is_swap_pmd(pmd))) {
@@ -1098,9 +1102,9 @@ int copy_huge_pmd(struct mm_struct *dst_mm, struct mm_struct *src_mm,
 			entry = make_readable_migration_entry(
 							swp_offset(entry));
 			pmd = swp_entry_to_pmd(entry);
-			if (pmd_swp_soft_dirty(*src_pmd))
+			if (pmd_swp_soft_dirty(pmd))
 				pmd = pmd_swp_mksoft_dirty(pmd);
-			if (pmd_swp_uffd_wp(*src_pmd))
+			if (pmd_swp_uffd_wp(pmd))
 				pmd = pmd_swp_mkuffd_wp(pmd);
 			set_pmd_at(src_mm, addr, src_pmd, pmd);
 		}
@@ -1280,13 +1284,10 @@ unlock:
 void huge_pmd_set_accessed(struct vm_fault *vmf)
 {
 	bool write = vmf->flags & FAULT_FLAG_WRITE;
-
 	vmf->ptl = pmd_lock(vmf->vma->vm_mm, vmf->pmd);
-	if (unlikely(!pmd_same(*vmf->pmd, vmf->orig_pmd)))
+        if (unlikely(!pmd_same(*vmf->pmd, vmf->orig_pmd)))
 		goto unlock;
-
 	touch_pmd(vmf->vma, vmf->address, vmf->pmd, write);
-
 unlock:
 	spin_unlock(vmf->ptl);
 }
@@ -1299,28 +1300,21 @@ vm_fault_t do_huge_pmd_wp_page(struct vm_fault *vmf)
 	struct page *page;
 	unsigned long haddr = vmf->address & HPAGE_PMD_MASK;
 	pmd_t orig_pmd = vmf->orig_pmd;
-
 	vmf->ptl = pmd_lockptr(vma->vm_mm, vmf->pmd);
 	VM_BUG_ON_VMA(!vma->anon_vma, vma);
-
 	if (is_huge_zero_pmd(orig_pmd))
 		goto fallback;
-
 	spin_lock(vmf->ptl);
-
 	if (unlikely(!pmd_same(*vmf->pmd, orig_pmd))) {
 		spin_unlock(vmf->ptl);
 		return 0;
 	}
-
 	page = pmd_page(orig_pmd);
 	folio = page_folio(page);
 	VM_BUG_ON_PAGE(!PageHead(page), page);
-
 	/* Early check when only holding the PT lock. */
 	if (PageAnonExclusive(page))
 		goto reuse;
-
 	if (!folio_trylock(folio)) {
 		folio_get(folio);
 		spin_unlock(vmf->ptl);
@@ -1334,13 +1328,11 @@ vm_fault_t do_huge_pmd_wp_page(struct vm_fault *vmf)
 		}
 		folio_put(folio);
 	}
-
 	/* Recheck after temporarily dropping the PT lock. */
 	if (PageAnonExclusive(page)) {
 		folio_unlock(folio);
 		goto reuse;
 	}
-
 	/*
 	 * See do_wp_page(): we can only reuse the folio exclusively if
 	 * there are no additional references. Note that we always drain
@@ -1353,7 +1345,6 @@ vm_fault_t do_huge_pmd_wp_page(struct vm_fault *vmf)
 		folio_free_swap(folio);
 	if (folio_ref_count(folio) == 1) {
 		pmd_t entry;
-
 		page_move_anon_rmap(page, vma);
 		folio_unlock(folio);
 reuse:
@@ -1368,7 +1359,6 @@ reuse:
 		spin_unlock(vmf->ptl);
 		return 0;
 	}
-
 unlock_fallback:
 	folio_unlock(folio);
 	spin_unlock(vmf->ptl);
@@ -1502,50 +1492,35 @@ vm_fault_t do_huge_pmd_numa_page(struct vm_fault *vmf)
 	int target_nid, last_cpupid = (-1 & LAST_CPUPID_MASK);
 	bool migrated = false, writable = false;
 	int flags = 0;
-
 	vmf->ptl = pmd_lock(vma->vm_mm, vmf->pmd);
-	if (unlikely(!pmd_same(oldpmd, *vmf->pmd))) {
+
+	oldpmd = pgtable_repl_get_pmd(vmf->pmd);
+	if (unlikely(!pmd_same(*vmf->pmd, vmf->orig_pmd))) {
 		spin_unlock(vmf->ptl);
 		goto out;
 	}
-
 	pmd = pmd_modify(oldpmd, vma->vm_page_prot);
-
-	/*
-	 * Detect now whether the PMD could be writable; this information
-	 * is only valid while holding the PT lock.
-	 */
 	writable = pmd_write(pmd);
 	if (!writable && vma_wants_manual_pte_write_upgrade(vma) &&
 	    can_change_pmd_writable(vma, vmf->address, pmd))
 		writable = true;
-
 	page = vm_normal_page_pmd(vma, haddr, pmd);
 	if (!page)
 		goto out_map;
-
-	/* See similar comment in do_numa_page for explanation */
 	if (!writable)
 		flags |= TNF_NO_GROUP;
-
 	page_nid = page_to_nid(page);
-	/*
-	 * For memory tiering mode, cpupid of slow memory page is used
-	 * to record page access time.  So use default value.
-	 */
+
 	if (node_is_toptier(page_nid))
 		last_cpupid = page_cpupid_last(page);
 	target_nid = numa_migrate_prep(page, vma, haddr, page_nid,
 				       &flags);
-
 	if (target_nid == NUMA_NO_NODE) {
 		put_page(page);
 		goto out_map;
 	}
-
 	spin_unlock(vmf->ptl);
 	writable = false;
-
 	migrated = migrate_misplaced_page(page, vma, target_nid);
 	if (migrated) {
 		flags |= TNF_MIGRATED;
@@ -1553,23 +1528,19 @@ vm_fault_t do_huge_pmd_numa_page(struct vm_fault *vmf)
 	} else {
 		flags |= TNF_MIGRATE_FAIL;
 		vmf->ptl = pmd_lock(vma->vm_mm, vmf->pmd);
-		if (unlikely(!pmd_same(oldpmd, *vmf->pmd))) {
+		if (unlikely(!pmd_same(*vmf->pmd, vmf->orig_pmd))) {
 			spin_unlock(vmf->ptl);
 			goto out;
 		}
 		goto out_map;
 	}
-
 out:
 	if (page_nid != NUMA_NO_NODE)
 		task_numa_fault(last_cpupid, page_nid, HPAGE_PMD_NR,
 				flags);
-
 	return 0;
-
 out_map:
-	/* Restore the PMD */
-	pmd = pmd_modify(oldpmd, vma->vm_page_prot);
+	pmd = pmd_modify(pgtable_repl_get_pmd(vmf->pmd), vma->vm_page_prot);
 	pmd = pmd_mkyoung(pmd);
 	if (writable)
 		pmd = pmd_mkwrite(pmd);
@@ -1591,23 +1562,18 @@ bool madvise_free_huge_pmd(struct mmu_gather *tlb, struct vm_area_struct *vma,
 	struct folio *folio;
 	struct mm_struct *mm = tlb->mm;
 	bool ret = false;
-
 	tlb_change_page_size(tlb, HPAGE_PMD_SIZE);
-
 	ptl = pmd_trans_huge_lock(pmd, vma);
 	if (!ptl)
 		goto out_unlocked;
-
-	orig_pmd = *pmd;
+	orig_pmd = pgtable_repl_get_pmd(pmd);
 	if (is_huge_zero_pmd(orig_pmd))
 		goto out;
-
 	if (unlikely(!pmd_present(orig_pmd))) {
 		VM_BUG_ON(thp_migration_supported() &&
 				  !is_pmd_migration_entry(orig_pmd));
 		goto out;
 	}
-
 	folio = pfn_folio(pmd_pfn(orig_pmd));
 	/*
 	 * If other processes are mapping this folio, we couldn't discard
@@ -1615,10 +1581,8 @@ bool madvise_free_huge_pmd(struct mmu_gather *tlb, struct vm_area_struct *vma,
 	 */
 	if (folio_mapcount(folio) != 1)
 		goto out;
-
 	if (!folio_trylock(folio))
 		goto out;
-
 	/*
 	 * If user want to discard part-pages of THP, split it so MADV_FREE
 	 * will deactivate only them.
@@ -1631,20 +1595,16 @@ bool madvise_free_huge_pmd(struct mmu_gather *tlb, struct vm_area_struct *vma,
 		folio_put(folio);
 		goto out_unlocked;
 	}
-
 	if (folio_test_dirty(folio))
 		folio_clear_dirty(folio);
 	folio_unlock(folio);
-
 	if (pmd_young(orig_pmd) || pmd_dirty(orig_pmd)) {
 		pmdp_invalidate(vma, addr, pmd);
 		orig_pmd = pmd_mkold(orig_pmd);
 		orig_pmd = pmd_mkclean(orig_pmd);
-
 		set_pmd_at(mm, addr, pmd, orig_pmd);
 		tlb_remove_pmd_tlb_entry(tlb, pmd, addr);
 	}
-
 	folio_mark_lazyfree(folio);
 	ret = true;
 out:
@@ -2037,7 +1997,6 @@ static void __split_huge_zero_page_pmd(struct vm_area_struct *vma,
 	pgtable_t pgtable;
 	pmd_t _pmd, old_pmd;
 	int i;
-
 	/*
 	 * Leave pmd empty until pte is filled note that it is fine to delay
 	 * notification until mmu_notifier_invalidate_range_end() as we are
@@ -2047,10 +2006,13 @@ static void __split_huge_zero_page_pmd(struct vm_area_struct *vma,
 	 * See Documentation/mm/mmu_notifier.rst
 	 */
 	old_pmd = pmdp_huge_clear_flush(vma, haddr, pmd);
-
 	pgtable = pgtable_trans_huge_withdraw(mm, pmd);
-	pmd_populate(mm, &_pmd, pgtable);
-
+	/*
+	 * Use pmd_populate_no_rep for the stack-local _pmd to avoid
+	 * premature PTE replica creation. Replicas will be created
+	 * when installing into the real pmd via pmd_populate below.
+	 */
+	pmd_populate_no_rep(mm, &_pmd, pgtable);
 	for (i = 0; i < HPAGE_PMD_NR; i++, haddr += PAGE_SIZE) {
 		pte_t *pte, entry;
 		entry = pfn_pte(my_zero_pfn(haddr), vma->vm_page_prot);
@@ -2063,6 +2025,11 @@ static void __split_huge_zero_page_pmd(struct vm_area_struct *vma,
 		pte_unmap(pte);
 	}
 	smp_wmb(); /* make pte visible before pmd */
+	/*
+	 * Free stale PTE replicas that were created empty at deposit
+	 * time. pmd_populate will recreate them with current content.
+	 */
+	pgtable_repl_free_pte_replicas(mm, pgtable);
 	pmd_populate(mm, pmd, pgtable);
 }
 
@@ -2202,7 +2169,31 @@ static void __split_huge_pmd_locked(struct vm_area_struct *vma, pmd_t *pmd,
 	 * This's critical for some architectures (Power).
 	 */
 	pgtable = pgtable_trans_huge_withdraw(mm, pmd);
-	pmd_populate(mm, &_pmd, pgtable);
+	
+	if (smp_load_acquire(&mm->repl_pgd_enabled) && virt_addr_valid(pmd)) {
+            int pmd_node = page_to_nid(virt_to_page(pmd));
+            int pte_node = page_to_nid(pgtable);
+            if (pmd_node != pte_node) {
+                struct page *new_pte = mitosis_alloc_replica_page(pmd_node, 0);
+                if (new_pte) {
+                    if (pgtable_pte_page_ctor(new_pte)) {
+                        new_pte->pt_owner_mm = mm;
+                        pgtable_pte_page_dtor(pgtable);
+                        __free_page(pgtable);
+                        pgtable = new_pte;
+                    } else {
+                        __free_page(new_pte);
+                    }
+                }
+            }
+        }
+	
+	/*
+	 * Use pmd_populate_no_rep for the stack-local _pmd to avoid
+	 * premature PTE replica creation. Replicas will be created
+	 * when installing into the real pmd via pmd_populate below.
+	 */
+	pmd_populate_no_rep(mm, &_pmd, pgtable);
 
 	for (i = 0, addr = haddr; i < HPAGE_PMD_NR; i++, addr += PAGE_SIZE) {
 		pte_t entry, *pte;
@@ -2260,6 +2251,12 @@ static void __split_huge_pmd_locked(struct vm_area_struct *vma, pmd_t *pmd,
 		put_page(page);
 
 	smp_wmb(); /* make pte visible before pmd */
+	/*
+	 * Free stale PTE replicas that were created empty at deposit
+	 * time. pmd_populate will recreate them with current content
+	 * via paravirt_alloc_pte, then install per-node PMD pointers.
+	 */
+	pgtable_repl_free_pte_replicas(mm, pgtable);
 	pmd_populate(mm, pmd, pgtable);
 }
 
@@ -2274,6 +2271,7 @@ void __split_huge_pmd(struct vm_area_struct *vma, pmd_t *pmd,
 				(address & HPAGE_PMD_MASK) + HPAGE_PMD_SIZE);
 	mmu_notifier_invalidate_range_start(&range);
 	ptl = pmd_lock(vma->vm_mm, pmd);
+	
 
 	/*
 	 * If caller asks to setup a migration entry, we need a folio to check
@@ -3260,39 +3258,35 @@ void remove_migration_pmd(struct page_vma_mapped_walk *pvmw, struct page *new)
 	unsigned long address = pvmw->address;
 	unsigned long haddr = address & HPAGE_PMD_MASK;
 	pmd_t pmde;
+	pmd_t pmdval;
 	swp_entry_t entry;
-
 	if (!(pvmw->pmd && !pvmw->pte))
 		return;
-
-	entry = pmd_to_swp_entry(*pvmw->pmd);
+	pmdval = pgtable_repl_get_pmd(pvmw->pmd);
+	entry = pmd_to_swp_entry(pmdval);
 	get_page(new);
 	pmde = mk_huge_pmd(new, READ_ONCE(vma->vm_page_prot));
-	if (pmd_swp_soft_dirty(*pvmw->pmd))
+	if (pmd_swp_soft_dirty(pmdval))
 		pmde = pmd_mksoft_dirty(pmde);
 	if (is_writable_migration_entry(entry))
 		pmde = pmd_mkwrite(pmde);
-	if (pmd_swp_uffd_wp(*pvmw->pmd))
+	if (pmd_swp_uffd_wp(pmdval))
 		pmde = pmd_mkuffd_wp(pmde);
 	if (!is_migration_entry_young(entry))
 		pmde = pmd_mkold(pmde);
 	/* NOTE: this may contain setting soft-dirty on some archs */
 	if (PageDirty(new) && is_migration_entry_dirty(entry))
 		pmde = pmd_mkdirty(pmde);
-
 	if (PageAnon(new)) {
 		rmap_t rmap_flags = RMAP_COMPOUND;
-
 		if (!is_readable_migration_entry(entry))
 			rmap_flags |= RMAP_EXCLUSIVE;
-
 		page_add_anon_rmap(new, vma, haddr, rmap_flags);
 	} else {
 		page_add_file_rmap(new, vma, true);
 	}
 	VM_BUG_ON(pmd_write(pmde) && PageAnon(new) && !PageAnonExclusive(new));
 	set_pmd_at(mm, haddr, pvmw->pmd, pmde);
-
 	/* No need to invalidate - it was non-present before */
 	update_mmu_cache_pmd(vma, address, pvmw->pmd);
 	trace_remove_migration_pmd(address, pmd_val(pmde));
