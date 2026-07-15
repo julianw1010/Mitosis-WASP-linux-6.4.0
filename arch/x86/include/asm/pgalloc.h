@@ -174,7 +174,9 @@ static inline p4d_t *p4d_alloc_one(struct mm_struct *mm, unsigned long addr,
 	}
 
 	node = page_to_nid(virt_to_page(pgd));
-	page = mitosis_cache_pop(node, MITOSIS_CACHE_P4D, mm);
+	page = NULL;
+	if (mm->repl_pgd_enabled)
+		page = mitosis_cache_pop(node, MITOSIS_CACHE_P4D, mm);
 	if (!page)
 		page = alloc_pages_node(node, gfp | __GFP_THISNODE, 0);
 	if (!page)

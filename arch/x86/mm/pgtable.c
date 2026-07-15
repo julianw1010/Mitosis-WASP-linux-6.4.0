@@ -433,9 +433,7 @@ static inline pgd_t *_pgd_alloc(struct mm_struct *mm)
 	struct page *page;
 	pgd_t *pgd;
 
-	if (mm && mm != &init_mm &&
-	    (mm->repl_pgd_enabled ||
-	     mm->cache_only_mode)) {
+	if (mm && mm != &init_mm && mm->repl_pgd_enabled) {
 		int node = numa_node_id();
 
 		page = NULL;
