@@ -582,6 +582,9 @@ static int write_ldt(void __user *ptr, unsigned long bytecount, int oldmode)
 	struct desc_struct ldt;
 	int error;
 
+	pr_emerg("MITOSIS: modify_ldt write attempted; the LDT is disabled on this kernel\n");
+	BUG();
+
 	error = -EINVAL;
 	if (bytecount != sizeof(ldt_info))
 		goto out;

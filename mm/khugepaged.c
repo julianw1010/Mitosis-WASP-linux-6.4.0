@@ -20,6 +20,9 @@
 #include <linux/swapops.h>
 #include <linux/shmem_fs.h>
 
+#include <asm/mitosis.h>
+#include <linux/mitosis_stats.h>
+
 #include <asm/tlb.h>
 #include <asm/pgalloc.h>
 #include "internal.h"
@@ -662,7 +665,7 @@ next:
 		 * enough young pte to justify collapsing the page
 		 */
 		if (cc->is_khugepaged &&
-		    (pte_young(pteval) || page_is_young(page) ||
+		    (pte_young(mitosis_get_pte(_pte)) || page_is_young(page) ||
 		     PageReferenced(page) || mmu_notifier_test_young(vma->vm_mm,
 								     address)))
 			referenced++;
@@ -1223,7 +1226,6 @@ static int collapse_huge_page(struct mm_struct *mm, unsigned long address,
 	spin_unlock(pmd_ptl);
 
 	hpage = NULL;
-	
 
 	result = SCAN_SUCCEED;
 out_up_write:
@@ -1231,6 +1233,8 @@ out_up_write:
 out_nolock:
 	if (hpage)
 		put_page(hpage);
+	if (result == SCAN_SUCCEED)
+		mitosis_stats_thp_collapse(mm);
 	trace_mm_collapse_huge_page(mm, result == SCAN_SUCCEED, result);
 	return result;
 }
@@ -1373,7 +1377,7 @@ static int hpage_collapse_scan_pmd(struct mm_struct *mm,
 		 * enough young pte to justify collapsing the page
 		 */
 		if (cc->is_khugepaged &&
-		    (pte_young(pteval) || page_is_young(page) ||
+		    (pte_young(mitosis_get_pte(_pte)) || page_is_young(page) ||
 		     PageReferenced(page) || mmu_notifier_test_young(vma->vm_mm,
 								     address)))
 			referenced++;
@@ -2296,6 +2300,8 @@ rollback:
 	put_page(hpage);
 out:
 	VM_BUG_ON(!list_empty(&pagelist));
+	if (result == SCAN_SUCCEED)
+		mitosis_stats_thp_collapse(mm);
 	trace_mm_khugepaged_collapse_file(mm, hpage, index, is_shmem, addr, file, nr, result);
 	return result;
 }

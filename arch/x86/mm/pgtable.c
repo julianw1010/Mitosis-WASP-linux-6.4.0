@@ -8,7 +8,8 @@
 #include <asm/mtrr.h>
 #include <linux/page-flags.h>
 
-#include <asm/pgtable_repl.h>
+#include <asm/mitosis.h>
+#include <linux/mitosis_stats.h>
 
 #ifdef CONFIG_DYNAMIC_PHYSICAL_MASK
 phys_addr_t physical_mask __ro_after_init = (1ULL << __PHYSICAL_MASK_SHIFT) - 1;
@@ -31,9 +32,9 @@ void paravirt_tlb_remove_table(struct mmu_gather *tlb, void *table)
 
 gfp_t __userpte_alloc_gfp = GFP_PGTABLE_USER | PGTABLE_HIGHMEM;
 
-pgtable_t pte_alloc_one(struct mm_struct *mm)
+pgtable_t pte_alloc_one(struct mm_struct *mm, pmd_t *pmd)
 {
-	return __pte_alloc_one(mm, __userpte_alloc_gfp);
+	return __pte_alloc_one(mm, __userpte_alloc_gfp, pmd);
 }
 
 static int __init setup_userpte(char *arg)
@@ -53,106 +54,58 @@ static int __init setup_userpte(char *arg)
 }
 early_param("userpte", setup_userpte);
 
+static void mitosis_free_tlb_page(struct mmu_gather *tlb, struct page *page,
+				  int level)
+{
+	mitosis_free_replica_chain(page, level, 0, tlb);
+
+	mitosis_pt_account_page(page, level, -1);
+	if (PageMitosisFromCache(page))
+		mitosis_cache_count_return(page->pt_owner_mm, page_to_nid(page));
+	page->pt_owner_mm = NULL;
+	tlb_remove_table(tlb, page);
+}
+
 void ___pte_free_tlb(struct mmu_gather *tlb, struct page *pte)
 {
-    int nid;
-    bool from_cache;
+	pgtable_pte_page_dtor(pte);
+	mitosis_free_tlb_page(tlb, pte, MITOSIS_CACHE_PTE);
 
-    nid = page_to_nid(pte);
-    from_cache = PageMitosisFromCache(pte);
-
-    pgtable_pte_page_dtor(pte);
-    paravirt_release_pte(tlb->mm, page_to_pfn(pte));
-
-    pte->pt_owner_mm = NULL;
-
-    if (from_cache) {
-        ClearPageMitosisFromCache(pte);
-        pte->pt_replica = NULL;
-        if (mitosis_cache_push(pte, nid, MITOSIS_CACHE_PTE))
-            return;
-    }
-    ClearPageMitosisFromCache(pte);
-    paravirt_tlb_remove_table(tlb, pte);
+	paravirt_release_pte(page_to_pfn(pte));
 }
 
 #if CONFIG_PGTABLE_LEVELS > 2
 void ___pmd_free_tlb(struct mmu_gather *tlb, pmd_t *pmd)
 {
-    struct page *page;
-    int nid;
-    bool from_cache;
+	struct page *page = virt_to_page(pmd);
 
-    page = virt_to_page(pmd);
-    nid = page_to_nid(page);
-    from_cache = PageMitosisFromCache(page);
+	pgtable_pmd_page_dtor(page);
+	mitosis_free_tlb_page(tlb, page, MITOSIS_CACHE_PMD);
 
-    paravirt_release_pmd(tlb->mm, __pa(pmd) >> PAGE_SHIFT);
+	paravirt_release_pmd(__pa(pmd) >> PAGE_SHIFT);
+	/*
+	 * NOTE! For PAE, any changes to the top page-directory-pointer-table
+	 * entries need a full cr3 reload to flush.
+	 */
 #ifdef CONFIG_X86_PAE
-    tlb->need_flush_all = 1;
+	tlb->need_flush_all = 1;
 #endif
-    pgtable_pmd_page_dtor(page);
-
-    page->pt_owner_mm = NULL;
-
-    if (from_cache) {
-        ClearPageMitosisFromCache(page);
-        page->pt_replica = NULL;
-        if (mitosis_cache_push(page, nid, MITOSIS_CACHE_PMD))
-            return;
-    }
-    ClearPageMitosisFromCache(page);
-    paravirt_tlb_remove_table(tlb, page);
 }
 
 #if CONFIG_PGTABLE_LEVELS > 3
 void ___pud_free_tlb(struct mmu_gather *tlb, pud_t *pud)
 {
-    struct page *page;
-    int nid;
-    bool from_cache;
+	mitosis_free_tlb_page(tlb, virt_to_page(pud), MITOSIS_CACHE_PUD);
 
-    page = virt_to_page(pud);
-    nid = page_to_nid(page);
-    from_cache = PageMitosisFromCache(page);
-
-    paravirt_release_pud(tlb->mm, __pa(pud) >> PAGE_SHIFT);
-
-    page->pt_owner_mm = NULL;
-
-    if (from_cache) {
-        ClearPageMitosisFromCache(page);
-        page->pt_replica = NULL;
-        if (mitosis_cache_push(page, nid, MITOSIS_CACHE_PUD))
-            return;
-    }
-    ClearPageMitosisFromCache(page);
-    paravirt_tlb_remove_table(tlb, page);
+	paravirt_release_pud(__pa(pud) >> PAGE_SHIFT);
 }
 
 #if CONFIG_PGTABLE_LEVELS > 4
 void ___p4d_free_tlb(struct mmu_gather *tlb, p4d_t *p4d)
 {
-    struct page *page;
-    int nid;
-    bool from_cache;
+	mitosis_free_tlb_page(tlb, virt_to_page(p4d), MITOSIS_CACHE_P4D);
 
-    page = virt_to_page(p4d);
-    nid = page_to_nid(page);
-    from_cache = PageMitosisFromCache(page);
-
-    paravirt_release_p4d(tlb->mm, __pa(p4d) >> PAGE_SHIFT);
-
-    page->pt_owner_mm = NULL;
-
-    if (from_cache) {
-        ClearPageMitosisFromCache(page);
-        page->pt_replica = NULL;
-        if (mitosis_cache_push(page, nid, MITOSIS_CACHE_P4D))
-            return;
-    }
-    ClearPageMitosisFromCache(page);
-    paravirt_tlb_remove_table(tlb, page);
+	paravirt_release_p4d(__pa(p4d) >> PAGE_SHIFT);
 }
 #endif	/* CONFIG_PGTABLE_LEVELS > 4 */
 #endif	/* CONFIG_PGTABLE_LEVELS > 3 */
@@ -330,10 +283,13 @@ static int preallocate_pmds(struct mm_struct *mm, pmd_t *pmds[], int count)
 static void mop_up_one_pmd(struct mm_struct *mm, pgd_t *pgdp)
 {
 	pgd_t pgd = *pgdp;
+
 	if (pgd_val(pgd) != 0) {
 		pmd_t *pmd = (pmd_t *)pgd_page_vaddr(pgd);
+
 		pgd_clear(pgdp);
-		paravirt_release_pmd(mm, pgd_val(pgd) >> PAGE_SHIFT);
+
+		paravirt_release_pmd(pgd_val(pgd) >> PAGE_SHIFT);
 		pmd_free(mm, pmd);
 		mm_dec_nr_pmds(mm);
 	}
@@ -447,106 +403,88 @@ void __init pgtable_cache_init(void)
 
 static inline pgd_t *_pgd_alloc(struct mm_struct *mm)
 {
-    struct page *page;
-    int order = mitosis_pgd_alloc_order();
-    gfp_t gfp = GFP_PGTABLE_USER;
-    pgd_t *pgd;
-    int nid;
+	/*
+	 * If no SHARED_KERNEL_PMD, PAE kernel is running as a Xen domain.
+	 * We allocate one page for pgd.
+	 */
+	if (!SHARED_KERNEL_PMD)
+		return (pgd_t *)__get_free_pages(GFP_PGTABLE_USER,
+						 PGD_ALLOCATION_ORDER);
 
-    if (!SHARED_KERNEL_PMD) {
-        if (mitosis_active(mm)) {
-            page = mitosis_alloc_primary(mm, gfp, order, MITOSIS_CACHE_PGD);
-            if (!page)
-                return NULL;
-        } else {
-            page = alloc_pages(gfp, order);
-            if (!page)
-                return NULL;
-        }
-
-        page->pt_owner_mm = mm;
-        return (pgd_t *)page_address(page);
-    }
-
-    pgd = kmem_cache_alloc(pgd_cache, GFP_PGTABLE_USER);
-    return pgd;
+	/*
+	 * Now PAE kernel is not running as a Xen domain. We can allocate
+	 * a 32-byte slab for pgd to save memory space.
+	 */
+	return kmem_cache_alloc(pgd_cache, GFP_PGTABLE_USER);
 }
 
 static inline void _pgd_free(struct mm_struct *mm, pgd_t *pgd)
 {
-    struct page *page;
-    int order;
-    int nid;
-    bool from_cache;
-
-    order = mitosis_pgd_alloc_order();
-
-    if (!SHARED_KERNEL_PMD) {
-        page = virt_to_page(pgd);
-        nid = page_to_nid(page);
-        from_cache = PageMitosisFromCache(page);
-
-
-        page->pt_owner_mm = NULL;
-
-        if (order == 0 && from_cache) {
-            ClearPageMitosisFromCache(page);
-            page->pt_replica = NULL;
-            if (mitosis_cache_push(page, nid, MITOSIS_CACHE_PGD))
-                return;
-        }
-        ClearPageMitosisFromCache(page);
-        free_pages((unsigned long)pgd, order);
-        return;
-    }
-
-    kmem_cache_free(pgd_cache, pgd);
+	if (!SHARED_KERNEL_PMD)
+		free_pages((unsigned long)pgd, PGD_ALLOCATION_ORDER);
+	else
+		kmem_cache_free(pgd_cache, pgd);
 }
 #else
 
 static inline pgd_t *_pgd_alloc(struct mm_struct *mm)
 {
-    struct page *page;
-    int order = mitosis_pgd_alloc_order();
-    gfp_t gfp = GFP_PGTABLE_USER;
+	int order = PGD_ALLOCATION_ORDER;
+	struct page *page;
+	pgd_t *pgd;
 
-    if (mitosis_active(mm)) {
-        page = mitosis_alloc_primary(mm, gfp, order, MITOSIS_CACHE_PGD);
-        if (!page)
-            return NULL;
-    } else {
-        page = alloc_pages(gfp, order);
-        if (!page)
-            return NULL;
-    }
+	if (mm && mm != &init_mm &&
+	    (mm->repl_pgd_enabled ||
+	     mm->cache_only_mode)) {
+		int node = numa_node_id();
 
-    page->pt_owner_mm = mm;
-    return (pgd_t *)page_address(page);
+		page = NULL;
+		if (order == 0)
+			page = mitosis_cache_pop(node, MITOSIS_CACHE_PGD, mm);
+		if (!page)
+			page = alloc_pages_node(node,
+						GFP_PGTABLE_USER | __GFP_THISNODE,
+						order);
+		if (!page)
+			return NULL;
+		pgd = (pgd_t *)page_address(page);
+	} else {
+		pgd = (pgd_t *)__get_free_pages(GFP_PGTABLE_USER, order);
+		if (!pgd)
+			return NULL;
+		page = virt_to_page(pgd);
+	}
+
+	page->pt_replica = NULL;
+	page->pt_owner_mm = mm;
+	return pgd;
 }
 
 static inline void _pgd_free(struct mm_struct *mm, pgd_t *pgd)
 {
-    struct page *page;
-    int order;
-    int nid;
-    bool from_cache;
+	struct page *page = virt_to_page(pgd);
+	int order = PGD_ALLOCATION_ORDER;
 
-    page = virt_to_page(pgd);
-    order = mitosis_pgd_alloc_order();
-    nid = page_to_nid(page);
-    from_cache = PageMitosisFromCache(page);
+	mitosis_pt_account_page(page, MITOSIS_CACHE_PGD, -1);
 
+	if (order == 0) {
+		int nid = page_to_nid(page);
+		bool from_cache = PageMitosisFromCache(page);
 
-    page->pt_owner_mm = NULL;
+		page->pt_owner_mm = NULL;
+		ClearPageMitosisFromCache(page);
 
-    if (order == 0 && from_cache) {
-        ClearPageMitosisFromCache(page);
-        page->pt_replica = NULL;
-        if (mitosis_cache_push(page, nid, MITOSIS_CACHE_PGD))
-            return;
-    }
-    ClearPageMitosisFromCache(page);
-    free_pages((unsigned long)pgd, order);
+		if (from_cache) {
+			page->pt_replica = NULL;
+			if (mitosis_cache_push(page, nid, MITOSIS_CACHE_PGD, mm))
+				return;
+		}
+	} else {
+		page->pt_owner_mm = NULL;
+		ClearPageMitosisFromCache(page);
+	}
+
+	free_pages((unsigned long)pgd, order);
 }
 #endif /* CONFIG_X86_PAE */
 
@@ -556,7 +494,7 @@ pgd_t *pgd_alloc(struct mm_struct *mm)
 	pmd_t *u_pmds[MAX_PREALLOCATED_USER_PMDS];
 	pmd_t *pmds[MAX_PREALLOCATED_PMDS];
 
-        pgd = _pgd_alloc(mm);
+	pgd = _pgd_alloc(mm);
 
 	if (pgd == NULL)
 		goto out;
@@ -677,14 +615,14 @@ int pudp_set_access_flags(struct vm_area_struct *vma, unsigned long address,
 int ptep_test_and_clear_young(struct vm_area_struct *vma,
 			      unsigned long addr, pte_t *ptep)
 {
-        return pgtable_repl_ptep_test_and_clear_young(vma, addr, ptep);
+	return mitosis_ptep_test_and_clear_young(vma, addr, ptep);
 }
 
 #if defined(CONFIG_TRANSPARENT_HUGEPAGE) || defined(CONFIG_ARCH_HAS_NONLEAF_PMD_YOUNG)
 int pmdp_test_and_clear_young(struct vm_area_struct *vma,
 			      unsigned long addr, pmd_t *pmdp)
 {
-	return pgtable_repl_pmdp_test_and_clear_young(vma, addr, pmdp);
+	return mitosis_pmdp_test_and_clear_young(vma, addr, pmdp);
 }
 #endif
 

@@ -3,7 +3,8 @@
 #include <linux/spinlock.h>
 #include <linux/highmem.h>
 #include <linux/page-flags.h>
-#include <asm/pgtable_repl.h>
+#include <asm/tlb.h>
+#include <asm/mitosis.h>
 
 struct mitosis_cache_head mitosis_cache[NUMA_NODE_COUNT] = {
 	[0 ... NUMA_NODE_COUNT - 1] = {
@@ -15,9 +16,14 @@ struct mitosis_cache_head mitosis_cache[NUMA_NODE_COUNT] = {
 		.returns	= ATOMIC64_INIT(0),
 	}
 };
-EXPORT_SYMBOL(mitosis_cache);
 
-bool mitosis_cache_push(struct page *page, int node, int level)
+static bool mitosis_cache_counted(struct mm_struct *owner_mm)
+{
+	return owner_mm && (owner_mm->repl_pgd_enabled || owner_mm->cache_only_mode);
+}
+
+bool mitosis_cache_push(struct page *page, int node, int level,
+			struct mm_struct *owner_mm)
 {
 	struct mitosis_cache_head *cache;
 	unsigned long flags;
@@ -36,14 +42,14 @@ bool mitosis_cache_push(struct page *page, int node, int level)
 	page->pt_replica = cache->head;
 	cache->head = page;
 	atomic_inc(&cache->count);
-	atomic64_inc(&cache->returns);
+	if (mitosis_cache_counted(owner_mm))
+		atomic64_inc(&cache->returns);
 	spin_unlock_irqrestore(&cache->lock, flags);
 
 	return true;
 }
-EXPORT_SYMBOL(mitosis_cache_push);
 
-struct page *mitosis_cache_pop(int node, int level)
+struct page *mitosis_cache_pop(int node, int level, struct mm_struct *owner_mm)
 {
 	struct mitosis_cache_head *cache;
 	struct page *page;
@@ -60,22 +66,22 @@ struct page *mitosis_cache_pop(int node, int level)
 	page = cache->head;
 	if (!page) {
 		spin_unlock_irqrestore(&cache->lock, flags);
-		atomic64_inc(&cache->misses);
+		if (mitosis_cache_counted(owner_mm))
+			atomic64_inc(&cache->misses);
 		return NULL;
 	}
 	cache->head = page->pt_replica;
 	atomic_dec(&cache->count);
-	atomic64_inc(&cache->hits);
+	if (mitosis_cache_counted(owner_mm))
+		atomic64_inc(&cache->hits);
 	spin_unlock_irqrestore(&cache->lock, flags);
 
 	page->pt_replica = NULL;
 	SetPageMitosisFromCache(page);
 
 	clear_highpage(page);
-
 	return page;
 }
-EXPORT_SYMBOL(mitosis_cache_pop);
 
 int mitosis_cache_drain_node(int node)
 {
@@ -107,65 +113,57 @@ int mitosis_cache_drain_node(int node)
 
 	return freed;
 }
-EXPORT_SYMBOL(mitosis_cache_drain_node);
 
 int mitosis_cache_drain_all(void)
 {
 	int node, total = 0;
 
-	for (node = 0; node < NUMA_NODE_COUNT; node++)
+	for (node = 0; node < NUMA_NODE_COUNT; node++) {
 		total += mitosis_cache_drain_node(node);
+	}
 
 	return total;
 }
-EXPORT_SYMBOL(mitosis_cache_drain_all);
 
-void mitosis_defer_pte_page_free(struct mm_struct *mm, struct page *page)
+void mitosis_cache_count_return(struct mm_struct *owner_mm, int node)
 {
-	unsigned long flags;
-
-	WRITE_ONCE(page->pt_replica, NULL);
-	pgtable_pte_page_dtor(page);
-	page->pt_owner_mm = NULL;
-
-	if (!mm) {
-		ClearPageMitosisFromCache(page);
-		__free_page(page);
+	if (node < 0 || node >= NUMA_NODE_COUNT)
 		return;
-	}
 
-	spin_lock_irqsave(&mm->mitosis_deferred_lock, flags);
-	page->pt_replica = mm->mitosis_deferred_pages;
-	mm->mitosis_deferred_pages = page;
-	spin_unlock_irqrestore(&mm->mitosis_deferred_lock, flags);
+	if (mitosis_cache_counted(owner_mm))
+		atomic64_inc(&mitosis_cache[node].returns);
 }
-EXPORT_SYMBOL(mitosis_defer_pte_page_free);
 
-void mitosis_drain_deferred_pages(struct mm_struct *mm)
+void mitosis_cache_defer(struct mmu_gather *tlb, struct page *page)
 {
-	struct page *page, *next;
-	unsigned long flags;
+	page->pt_replica = tlb->mitosis_deferred_cache;
+	tlb->mitosis_deferred_cache = page;
+}
 
-	if (!mm || !READ_ONCE(mm->mitosis_deferred_pages))
-		return;
+void mitosis_cache_defer_drain(struct mmu_gather *tlb)
+{
+	struct page *page = tlb->mitosis_deferred_cache;
 
-	spin_lock_irqsave(&mm->mitosis_deferred_lock, flags);
-	page = mm->mitosis_deferred_pages;
-	mm->mitosis_deferred_pages = NULL;
-	spin_unlock_irqrestore(&mm->mitosis_deferred_lock, flags);
+	tlb->mitosis_deferred_cache = NULL;
 
 	while (page) {
-		int nid = page_to_nid(page);
-		bool from_cache = PageMitosisFromCache(page);
-		next = page->pt_replica;
+		struct page *next = page->pt_replica;
+		struct mm_struct *owner_mm = page->pt_owner_mm;
+
 		page->pt_replica = NULL;
-		ClearPageMitosisFromCache(page);
-		if (from_cache && mitosis_cache_push(page, nid, MITOSIS_CACHE_PTE)) {
-			page = next;
-			continue;
-		}
-		__free_page(page);
+		if (!mitosis_cache_push(page, page_to_nid(page), 0, owner_mm))
+			__free_page(page);
 		page = next;
 	}
 }
-EXPORT_SYMBOL(mitosis_drain_deferred_pages);
+
+bool mitosis_cache_return_table(struct page *page)
+{
+	if (!PageMitosisFromCache(page))
+		return false;
+
+	if (!mitosis_cache_push(page, page_to_nid(page), 0, NULL))
+		__free_page(page);
+
+	return true;
+}

@@ -7139,6 +7139,9 @@ pte_t *huge_pmd_share(struct mm_struct *mm, struct vm_area_struct *vma,
 	pte_t *pte;
 	spinlock_t *ptl;
 
+	pr_emerg("MITOSIS: hugetlb pmd sharing attempted; hugetlb is disabled on this kernel\n");
+	BUG();
+
 	i_mmap_lock_read(mapping);
 	vma_interval_tree_foreach(svma, &mapping->i_mmap, idx, idx) {
 		if (svma == vma)

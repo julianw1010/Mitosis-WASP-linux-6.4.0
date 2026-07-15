@@ -188,6 +188,11 @@
  *  various ptep_get_and_clear() functions.
  */
 
+struct mmu_gather;
+void mitosis_cache_defer(struct mmu_gather *tlb, struct page *page);
+void mitosis_cache_defer_drain(struct mmu_gather *tlb);
+bool mitosis_cache_return_table(struct page *page);
+
 #ifdef CONFIG_MMU_GATHER_TABLE_FREE
 
 struct mmu_table_batch {
@@ -338,6 +343,8 @@ struct mmu_gather {
 	unsigned int		vma_pfn  : 1;
 
 	unsigned int		batch_count;
+
+	struct page		*mitosis_deferred_cache;
 
 #ifndef CONFIG_MMU_GATHER_NO_GATHER
 	struct mmu_gather_batch *active;

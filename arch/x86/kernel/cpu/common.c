@@ -669,15 +669,6 @@ static void filter_cpuid_features(struct cpuinfo_x86 *c, bool warn)
 		pr_warn("CPU: CPU feature " X86_CAP_FMT " disabled, no CPUID level 0x%x\n",
 			x86_cap_flag(df->feature), df->level);
 	}
-	
-        if (c == &boot_cpu_data) {
-		pr_notice("MITOSIS: Disabling PCID/INVPCID for page table replication\n");
-		setup_clear_cpu_cap(X86_FEATURE_PCID);
-		setup_clear_cpu_cap(X86_FEATURE_INVPCID);
-	}
-	clear_cpu_cap(c, X86_FEATURE_PCID);
-	clear_cpu_cap(c, X86_FEATURE_INVPCID);
-
 }
 
 /*

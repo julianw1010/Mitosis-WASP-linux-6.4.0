@@ -84,7 +84,7 @@
 
 #include "internal.h"
 
-#include <asm/pgtable_repl.h>
+#include <asm/mitosis.h>
 
 static struct kmem_cache *anon_vma_cachep;
 static struct kmem_cache *anon_vma_chain_cachep;
@@ -944,6 +944,7 @@ static int page_vma_mkclean_one(struct page_vma_mapped_walk *pvmw)
 	struct vm_area_struct *vma = pvmw->vma;
 	struct mmu_notifier_range range;
 	unsigned long address = pvmw->address;
+
 	/*
 	 * We have to assume the worse case ie pmd for invalidation. Note that
 	 * the folio can not be freed from this function.
@@ -951,14 +952,18 @@ static int page_vma_mkclean_one(struct page_vma_mapped_walk *pvmw)
 	mmu_notifier_range_init(&range, MMU_NOTIFY_PROTECTION_PAGE, 0,
 				vma->vm_mm, address, vma_address_end(pvmw));
 	mmu_notifier_invalidate_range_start(&range);
+
 	while (page_vma_mapped_walk(pvmw)) {
 		int ret = 0;
+
 		address = pvmw->address;
 		if (pvmw->pte) {
 			pte_t entry;
 			pte_t *pte = pvmw->pte;
+
 			if (!pte_dirty(*pte) && !pte_write(*pte))
 				continue;
+
 			flush_cache_page(vma, address, pte_pfn(*pte));
 			entry = ptep_clear_flush(vma, address, pte);
 			entry = pte_wrprotect(entry);
@@ -969,9 +974,10 @@ static int page_vma_mkclean_one(struct page_vma_mapped_walk *pvmw)
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE
 			pmd_t *pmd = pvmw->pmd;
 			pmd_t entry;
-			pmd_t cur_pmd = pgtable_repl_get_pmd(pmd);
-			if (!pmd_dirty(cur_pmd) && !pmd_write(cur_pmd))
+
+			if (!pmd_dirty(*pmd) && !pmd_write(*pmd))
 				continue;
+
 			flush_cache_range(vma, address,
 					  address + HPAGE_PMD_SIZE);
 			entry = pmdp_invalidate(vma, address, pmd);
@@ -984,6 +990,7 @@ static int page_vma_mkclean_one(struct page_vma_mapped_walk *pvmw)
 			WARN_ON_ONCE(1);
 #endif
 		}
+
 		/*
 		 * No need to call mmu_notifier_invalidate_range() as we are
 		 * downgrading page table protection not changing it to point
@@ -994,7 +1001,9 @@ static int page_vma_mkclean_one(struct page_vma_mapped_walk *pvmw)
 		if (ret)
 			cleaned++;
 	}
+
 	mmu_notifier_invalidate_range_end(&range);
+
 	return cleaned;
 }
 

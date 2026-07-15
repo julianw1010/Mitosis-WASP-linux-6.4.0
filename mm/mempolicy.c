@@ -891,8 +891,8 @@ static void get_policy_nodemask(struct mempolicy *p, nodemask_t *nodes)
 	case MPOL_INTERLEAVE:
 	case MPOL_PREFERRED:
 	case MPOL_PREFERRED_MANY:
-	*nodes = p->nodes;
-	break;
+		*nodes = p->nodes;
+		break;
 	case MPOL_LOCAL:
 		/* return empty node mask for local allocation */
 		break;
@@ -1848,6 +1848,7 @@ nodemask_t *policy_nodemask(gfp_t gfp, struct mempolicy *policy)
 
 	if (mode == MPOL_PREFERRED_MANY)
 		return &policy->nodes;
+
 	return NULL;
 }
 
@@ -1870,10 +1871,12 @@ static int policy_node(gfp_t gfp, struct mempolicy *policy, int nd)
 		 */
 		WARN_ON_ONCE(policy->mode == MPOL_BIND && (gfp & __GFP_THISNODE));
 	}
+
 	if ((policy->mode == MPOL_BIND ||
 	     policy->mode == MPOL_PREFERRED_MANY) &&
 	    policy->home_node != NUMA_NO_NODE)
 		return policy->home_node;
+
 	return nd;
 }
 
@@ -2367,6 +2370,7 @@ unsigned long alloc_pages_bulk_array_mempolicy(gfp_t gfp,
 	if (pol->mode == MPOL_PREFERRED_MANY)
 		return alloc_pages_bulk_array_preferred_many(gfp,
 				numa_node_id(), pol, nr_pages, page_array);
+
 	return __alloc_pages_bulk(gfp, policy_node(gfp, pol, numa_node_id()),
 				  policy_nodemask(gfp, pol), nr_pages, NULL,
 				  page_array);

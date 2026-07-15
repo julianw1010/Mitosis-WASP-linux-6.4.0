@@ -56,7 +56,7 @@
 #define CREATE_TRACE_POINTS
 #include <trace/events/mmap.h>
 
-#include <asm/pgtable_repl.h>
+#include <asm/mitosis.h>
 
 #include "internal.h"
 
@@ -3119,7 +3119,6 @@ void exit_mmap(struct mm_struct *mm)
 	mt_clear_in_rcu(&mm->mm_mt);
 	free_pgtables(&tlb, &mm->mm_mt, vma, FIRST_USER_ADDRESS,
 		      USER_PGTABLES_CEILING, true);
-        
 	tlb_finish_mmu(&tlb);
 
 	/*

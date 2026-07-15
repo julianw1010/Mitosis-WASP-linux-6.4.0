@@ -91,7 +91,8 @@
 #include "internal.h"
 #include "swap.h"
 
-#include <asm/pgtable_repl.h>
+#include <asm/mitosis.h>
+#include <linux/mitosis_stats.h>
 
 #if defined(LAST_CPUPID_NOT_IN_PAGE_FLAGS) && !defined(CONFIG_COMPILE_TEST)
 #warning Unfortunate NUMA and NUMA Balancing config, growing page-frame for last_cpupid.
@@ -438,7 +439,7 @@ void pmd_install(struct mm_struct *mm, pmd_t *pmd, pgtable_t *pte)
 
 int __pte_alloc(struct mm_struct *mm, pmd_t *pmd)
 {
-	pgtable_t new = pte_alloc_one(mm);
+	pgtable_t new = pte_alloc_one(mm, pmd);
 	if (!new)
 		return -ENOMEM;
 
@@ -4170,7 +4171,7 @@ static vm_fault_t __do_fault(struct vm_fault *vmf)
 	 *				# flush A, B to clear the writeback
 	 */
 	if (pmd_none(*vmf->pmd) && !vmf->prealloc_pte) {
-		vmf->prealloc_pte = pte_alloc_one(vma->vm_mm);
+		vmf->prealloc_pte = pte_alloc_one(vma->vm_mm, vmf->pmd);
 		if (!vmf->prealloc_pte)
 			return VM_FAULT_OOM;
 	}
@@ -4249,7 +4250,7 @@ vm_fault_t do_set_pmd(struct vm_fault *vmf, struct page *page)
 	 * related to pte entry. Use the preallocated table for that.
 	 */
 	if (arch_needs_pgtable_deposit() && !vmf->prealloc_pte) {
-		vmf->prealloc_pte = pte_alloc_one(vma->vm_mm);
+		vmf->prealloc_pte = pte_alloc_one(vma->vm_mm, vmf->pmd);
 		if (!vmf->prealloc_pte)
 			return VM_FAULT_OOM;
 	}
@@ -4486,7 +4487,7 @@ static vm_fault_t do_fault_around(struct vm_fault *vmf)
 		      pte_off + vma_pages(vmf->vma) - vma_off) - 1;
 
 	if (pmd_none(*vmf->pmd)) {
-		vmf->prealloc_pte = pte_alloc_one(vmf->vma->vm_mm);
+		vmf->prealloc_pte = pte_alloc_one(vmf->vma->vm_mm, vmf->pmd);
 		if (!vmf->prealloc_pte)
 			return VM_FAULT_OOM;
 	}
@@ -4772,6 +4773,7 @@ static vm_fault_t do_numa_page(struct vm_fault *vmf)
 
 	/* Migrate to the requested node */
 	if (migrate_misplaced_page(page, vma, target_nid)) {
+		mitosis_stats_numa(vma->vm_mm, false, page_nid, target_nid);
 		page_nid = target_nid;
 		flags |= TNF_MIGRATED;
 	} else {
@@ -5017,6 +5019,7 @@ static vm_fault_t __handle_mm_fault(struct vm_area_struct *vma,
 	p4d = p4d_alloc(mm, pgd, address);
 	if (!p4d)
 		return VM_FAULT_OOM;
+
 	vmf.pud = pud_alloc(mm, p4d, address);
 	if (!vmf.pud)
 		return VM_FAULT_OOM;
@@ -5028,8 +5031,10 @@ retry_pud:
 			return ret;
 	} else {
 		pud_t orig_pud = *vmf.pud;
+
 		barrier();
 		if (pud_trans_huge(orig_pud) || pud_devmap(orig_pud)) {
+
 			/*
 			 * TODO once we support anonymous PUDs: NUMA case and
 			 * FAULT_FLAG_UNSHARE handling.
@@ -5044,19 +5049,23 @@ retry_pud:
 			}
 		}
 	}
+
 	vmf.pmd = pmd_alloc(mm, vmf.pud, address);
 	if (!vmf.pmd)
 		return VM_FAULT_OOM;
+
 	/* Huge pud page fault raced with pmd_alloc? */
 	if (pud_trans_unstable(vmf.pud))
 		goto retry_pud;
+
 	if (pmd_none(*vmf.pmd) &&
 	    hugepage_vma_check(vma, vm_flags, false, true, true)) {
 		ret = create_huge_pmd(&vmf);
 		if (!(ret & VM_FAULT_FALLBACK))
 			return ret;
 	} else {
-		vmf.orig_pmd = pmdp_get_lockless(vmf.pmd);
+		vmf.orig_pmd = *vmf.pmd;
+
 		barrier();
 		if (unlikely(is_swap_pmd(vmf.orig_pmd))) {
 			VM_BUG_ON(thp_migration_supported() &&
@@ -5068,6 +5077,7 @@ retry_pud:
 		if (pmd_trans_huge(vmf.orig_pmd) || pmd_devmap(vmf.orig_pmd)) {
 			if (pmd_protnone(vmf.orig_pmd) && vma_is_accessible(vma))
 				return do_huge_pmd_numa_page(&vmf);
+
 			if ((flags & (FAULT_FLAG_WRITE|FAULT_FLAG_UNSHARE)) &&
 			    !pmd_write(vmf.orig_pmd)) {
 				ret = wp_huge_pmd(&vmf);
@@ -5079,7 +5089,8 @@ retry_pud:
 			}
 		}
 	}
-        return handle_pte_fault(&vmf);
+
+	return handle_pte_fault(&vmf);
 }
 
 /**
@@ -5230,14 +5241,12 @@ vm_fault_t handle_mm_fault(struct vm_area_struct *vma, unsigned long address,
 
 	lru_gen_enter_fault(vma);
 
-	if (unlikely(is_vm_hugetlb_page(vma)))
+	if (unlikely(is_vm_hugetlb_page(vma))) {
+		pr_emerg("MITOSIS: hugetlb fault attempted; hugetlb is disabled on this kernel\n");
+		BUG();
 		ret = hugetlb_fault(vma->vm_mm, vma, address, flags);
-	else
+	} else
 		ret = __handle_mm_fault(vma, address, flags);
-
-	if (smp_load_acquire(&vma->vm_mm->repl_pgd_enabled) &&
-		!(ret & (VM_FAULT_ERROR | VM_FAULT_RETRY)))
-		mitosis_verify_fault_walk(vma->vm_mm, address);
 
 	lru_gen_exit_fault();
 
@@ -5327,7 +5336,7 @@ inval:
  */
 int __p4d_alloc(struct mm_struct *mm, pgd_t *pgd, unsigned long address)
 {
-	p4d_t *new = p4d_alloc_one(mm, address);
+	p4d_t *new = p4d_alloc_one(mm, address, pgd);
 	if (!new)
 		return -ENOMEM;
 
@@ -5350,7 +5359,7 @@ int __p4d_alloc(struct mm_struct *mm, pgd_t *pgd, unsigned long address)
  */
 int __pud_alloc(struct mm_struct *mm, p4d_t *p4d, unsigned long address)
 {
-	pud_t *new = pud_alloc_one(mm, address);
+	pud_t *new = pud_alloc_one(mm, address, p4d);
 	if (!new)
 		return -ENOMEM;
 
@@ -5374,7 +5383,7 @@ int __pud_alloc(struct mm_struct *mm, p4d_t *p4d, unsigned long address)
 int __pmd_alloc(struct mm_struct *mm, pud_t *pud, unsigned long address)
 {
 	spinlock_t *ptl;
-	pmd_t *new = pmd_alloc_one(mm, address);
+	pmd_t *new = pmd_alloc_one(mm, address, pud);
 	if (!new)
 		return -ENOMEM;
 

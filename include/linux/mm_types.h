@@ -19,10 +19,10 @@
 #include <linux/workqueue.h>
 #include <linux/seqlock.h>
 #include <linux/percpu_counter.h>
-#include <linux/nodemask.h>
 
 #include <asm/mmu.h>
 
+#include <linux/nodemask.h>
 #include <linux/ktime.h>
 
 #ifndef AT_VECTOR_SIZE_ARCH
@@ -237,9 +237,8 @@ struct page {
 #ifdef LAST_CPUPID_NOT_IN_PAGE_FLAGS
 	int _last_cpupid;
 #endif
-
-            struct page *pt_replica;
-            struct mm_struct *pt_owner_mm;
+	struct page *pt_replica;
+	struct mm_struct *pt_owner_mm;
 } _struct_page_alignment;
 
 /*
@@ -610,23 +609,15 @@ struct mm_struct {
 #endif
 		unsigned long task_size;	/* size of task vm space */
 
-                bool repl_pgd_enabled;
-		bool repl_in_progress;
+		bool repl_pgd_enabled;
 		bool repl_pending_enable;
 		bool cache_only_mode;
 		nodemask_t repl_pgd_nodes;
-		nodemask_t repl_pending_nodes;
 		struct mutex repl_mutex;
-		spinlock_t repl_alloc_lock;
-		spinlock_t mitosis_deferred_lock;
-		struct page *mitosis_deferred_pages;
 		pgd_t *pgd_replicas[NUMA_NODE_COUNT];
-		pgd_t *original_pgd;
 		int repl_steering[NUMA_NODE_COUNT];
+		struct mitosis_stats *mitosis_stats;
 
-		atomic_t pgtable_interleave_counter;
-		
-		
 		pgd_t * pgd;
 
 #ifdef CONFIG_MEMBARRIER

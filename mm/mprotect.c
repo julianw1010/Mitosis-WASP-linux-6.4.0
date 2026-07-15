@@ -39,8 +39,6 @@
 
 #include "internal.h"
 
-#include <asm/pgtable_repl.h>
-
 bool can_change_pte_writable(struct vm_area_struct *vma, unsigned long addr,
 			     pte_t pte)
 {
@@ -120,8 +118,7 @@ static long change_pte_range(struct mmu_gather *tlb,
 	flush_tlb_batched_pending(vma->vm_mm);
 	arch_enter_lazy_mmu_mode();
 	do {
-		oldpte = pgtable_repl_get_pte(pte);
-		
+		oldpte = *pte;
 		if (pte_present(oldpte)) {
 			pte_t ptent;
 

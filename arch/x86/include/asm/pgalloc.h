@@ -6,7 +6,7 @@
 #include <linux/mm.h>		/* for struct page */
 #include <linux/pagemap.h>
 
-#include <asm/pgtable_repl.h>
+#include <asm/mitosis.h>
 
 #define __HAVE_ARCH_PTE_ALLOC_ONE
 #define __HAVE_ARCH_PGD_FREE
@@ -53,7 +53,7 @@ extern gfp_t __userpte_alloc_gfp;
 extern pgd_t *pgd_alloc(struct mm_struct *);
 extern void pgd_free(struct mm_struct *mm, pgd_t *pgd);
 
-extern pgtable_t pte_alloc_one(struct mm_struct *);
+extern pgtable_t pte_alloc_one(struct mm_struct *, pmd_t *);
 
 extern void ___pte_free_tlb(struct mmu_gather *tlb, struct page *pte);
 
@@ -84,7 +84,6 @@ static inline void pmd_populate_no_rep(struct mm_struct *mm, pmd_t *pmd,
 
 	native_set_pmd(pmd, __pmd(((pteval_t)pfn << PAGE_SHIFT) | _PAGE_TABLE));
 }
-
 
 static inline void pmd_populate(struct mm_struct *mm, pmd_t *pmd,
 				struct page *pte)
@@ -158,53 +157,42 @@ static inline void pgd_populate_safe(struct mm_struct *mm, pgd_t *pgd, p4d_t *p4
 	set_pgd_safe(pgd, __pgd(_PAGE_TABLE | __pa(p4d)));
 }
 
-static inline p4d_t *p4d_alloc_one(struct mm_struct *mm, unsigned long addr)
+static inline p4d_t *p4d_alloc_one(struct mm_struct *mm, unsigned long addr,
+				   pgd_t *pgd)
 {
-    gfp_t gfp = GFP_KERNEL_ACCOUNT;
-    struct page *page;
+	gfp_t gfp = GFP_KERNEL_ACCOUNT | __GFP_ZERO;
+	struct page *page;
+	int node;
 
-    if (mm == &init_mm)
-        gfp &= ~__GFP_ACCOUNT;
+	if (mm == &init_mm) {
+		page = alloc_page(gfp & ~__GFP_ACCOUNT);
+		if (!page)
+			return NULL;
+		page->pt_replica = NULL;
+		page->pt_owner_mm = NULL;
+		return (p4d_t *)page_address(page);
+	}
 
-    if (mitosis_active(mm)) {
-        page = mitosis_alloc_primary(mm, gfp | __GFP_ZERO, 0, MITOSIS_CACHE_P4D);
-        if (!page)
-            return NULL;
-        page->pt_owner_mm = mm;
-        return (p4d_t *)page_address(page);
-    }
+	node = page_to_nid(virt_to_page(pgd));
+	page = mitosis_cache_pop(node, MITOSIS_CACHE_P4D, mm);
+	if (!page)
+		page = alloc_pages_node(node, gfp | __GFP_THISNODE, 0);
+	if (!page)
+		return NULL;
 
-    page = alloc_pages(gfp | __GFP_ZERO, 0);
-    if (!page)
-        return NULL;
-    page->pt_owner_mm = mm;
-    return (p4d_t *)page_address(page);
+	page->pt_replica = NULL;
+	page->pt_owner_mm = mm;
+	mitosis_pt_account_page(page, MITOSIS_CACHE_P4D, 1);
+	return (p4d_t *)page_address(page);
 }
 
 static inline void p4d_free(struct mm_struct *mm, p4d_t *p4d)
 {
-    struct page *page;
-    int nid;
-    bool from_cache;
+	if (!pgtable_l5_enabled())
+		return;
 
-    if (!pgtable_l5_enabled())
-        return;
-
-    BUG_ON((unsigned long)p4d & (PAGE_SIZE-1));
-    page = virt_to_page(p4d);
-    nid = page_to_nid(page);
-    from_cache = PageMitosisFromCache(page);
-
-    page->pt_owner_mm = NULL;
-
-    if (from_cache) {
-        ClearPageMitosisFromCache(page);
-        page->pt_replica = NULL;
-        if (mitosis_cache_push(page, nid, MITOSIS_CACHE_P4D))
-            return;
-    }
-    ClearPageMitosisFromCache(page);
-    free_page((unsigned long)p4d);
+	BUG_ON((unsigned long)p4d & (PAGE_SIZE-1));
+	mitosis_dtor_free_page(virt_to_page(p4d), MITOSIS_CACHE_P4D);
 }
 
 extern void ___p4d_free_tlb(struct mmu_gather *tlb, p4d_t *p4d);

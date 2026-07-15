@@ -31,6 +31,9 @@ static inline void tlb_flush(struct mmu_gather *tlb)
  */
 static inline void __tlb_remove_table(void *table)
 {
+	if (mitosis_cache_return_table(table))
+		return;
+
 	free_page_and_swap_cache(table);
 }
 

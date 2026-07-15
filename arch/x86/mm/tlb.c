@@ -19,7 +19,8 @@
 #include <asm/apic.h>
 #include <asm/perf_event.h>
 
-#include <asm/pgtable_repl.h>
+#include <asm/mitosis.h>
+#include <linux/mitosis_stats.h>
 
 #include "mm_internal.h"
 
@@ -505,13 +506,10 @@ void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
 	bool need_flush;
 	u16 new_asid;
 	pgd_t *pgd_to_use;
-
-	bool using_replica = false;
 	bool rcu_held = false;
 	int local_node;
 	int target_node;
 	bool repl_enabled;
-	bool repl_in_progress;
 	pgd_t *selected_replica = NULL;
 
 	local_node = numa_node_id();
@@ -523,33 +521,26 @@ void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
 	pgd_to_use = next->pgd;
 
 	if (repl_enabled) {
-		repl_in_progress = smp_load_acquire(&next->repl_in_progress);
+		pgd_t *node_pgd;
+		int steered_node;
 
-		if (!repl_in_progress) {
-			pgd_t *node_pgd;
-			int steered_node;
+		steered_node = READ_ONCE(next->repl_steering[local_node]);
+		if (steered_node >= 0 && steered_node < NUMA_NODE_COUNT)
+			target_node = steered_node;
+		else
+			target_node = local_node;
 
-			steered_node = READ_ONCE(next->repl_steering[local_node]);
-			if (steered_node >= 0 && steered_node < MAX_NUMNODES) {
-				target_node = steered_node;
-			} else {
-				target_node = local_node;
-			}
+		node_pgd = READ_ONCE(next->pgd_replicas[target_node]);
 
-			node_pgd = READ_ONCE(next->pgd_replicas[target_node]);
+		if (node_pgd && virt_addr_valid(node_pgd)) {
+			if (next->repl_pgd_enabled) {
+				struct page *pgd_page = virt_to_page(node_pgd);
 
-			if (node_pgd && virt_addr_valid(node_pgd)) {
-				if (smp_load_acquire(&next->repl_pgd_enabled) &&
-				    !smp_load_acquire(&next->repl_in_progress)) {
-					struct page *pgd_page = virt_to_page(node_pgd);
-
-					if (pgd_page && page_to_nid(pgd_page) == target_node) {
-						unsigned long pa = __pa(node_pgd);
-						if (pa && pfn_valid(pa >> PAGE_SHIFT)) {
-							selected_replica = node_pgd;
-							pgd_to_use = node_pgd;
-							using_replica = (node_pgd != next->pgd);
-						}
+				if (pgd_page && page_to_nid(pgd_page) == target_node) {
+					unsigned long pa = __pa(node_pgd);
+					if (pa && pfn_valid(pa >> PAGE_SHIFT)) {
+						selected_replica = node_pgd;
+						pgd_to_use = node_pgd;
 					}
 				}
 			}
@@ -569,6 +560,7 @@ void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
 	if (IS_ENABLED(CONFIG_PROVE_LOCKING))
 		WARN_ON_ONCE(!irqs_disabled());
 
+#if 0
 	/*
 	 * Verify that CR3 is what we think it is.  This will catch
 	 * hypothetical buggy code that directly switches to swapper_pg_dir
@@ -578,7 +570,6 @@ void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
 	 * Only do this check if CONFIG_DEBUG_VM=y because __read_cr3()
 	 * isn't free.
 	 */
-#if 0
 #ifdef CONFIG_DEBUG_VM
 	if (WARN_ON_ONCE(__read_cr3() != build_cr3(real_prev->pgd, prev_asid,
 						   tlbstate_lam_cr3_mask()))) {
@@ -638,16 +629,15 @@ void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
 			unsigned long target_cr3_pa = __pa(selected_replica);
 
 			if (current_cr3_pa != target_cr3_pa) {
-				if (smp_load_acquire(&next->repl_pgd_enabled) &&
-				    !smp_load_acquire(&next->repl_in_progress)) {
+				if (next->repl_pgd_enabled) {
 					unsigned long new_cr3 = target_cr3_pa | (__read_cr3() & ~PAGE_MASK);
 
+					next_tlb_gen = atomic64_read(&next->context.tlb_gen);
 					native_write_cr3(new_cr3);
 					__flush_tlb_all();
+					this_cpu_write(cpu_tlbstate.ctxs[prev_asid].tlb_gen, next_tlb_gen);
 				}
-
 				rcu_read_unlock();
-				rcu_held = false;
 				return;
 			}
 		} else if (repl_enabled) {
@@ -656,11 +646,12 @@ void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
 
 			if (current_cr3_pa != primary_cr3_pa) {
 				unsigned long new_cr3 = primary_cr3_pa | (__read_cr3() & ~PAGE_MASK);
+
+				next_tlb_gen = atomic64_read(&next->context.tlb_gen);
 				native_write_cr3(new_cr3);
 				__flush_tlb_all();
-
+				this_cpu_write(cpu_tlbstate.ctxs[prev_asid].tlb_gen, next_tlb_gen);
 				rcu_read_unlock();
-				rcu_held = false;
 				return;
 			}
 		}
@@ -730,10 +721,8 @@ void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
 	}
 
 	if (selected_replica) {
-		if (!smp_load_acquire(&next->repl_pgd_enabled) ||
-		    smp_load_acquire(&next->repl_in_progress)) {
+		if (!READ_ONCE(next->repl_pgd_enabled)) {
 			pgd_to_use = next->pgd;
-			using_replica = false;
 			selected_replica = NULL;
 		}
 	}
@@ -743,10 +732,12 @@ void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
 		this_cpu_write(cpu_tlbstate.ctxs[new_asid].ctx_id, next->context.ctx_id);
 		this_cpu_write(cpu_tlbstate.ctxs[new_asid].tlb_gen, next_tlb_gen);
 		load_new_mm_cr3(pgd_to_use, new_asid, new_lam, true);
+
 		trace_tlb_flush(TLB_FLUSH_ON_TASK_SWITCH, TLB_FLUSH_ALL);
 	} else {
 		/* The new ASID is already up to date. */
 		load_new_mm_cr3(pgd_to_use, new_asid, new_lam, false);
+
 		trace_tlb_flush(TLB_FLUSH_ON_TASK_SWITCH, 0);
 	}
 
@@ -755,7 +746,6 @@ void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
 
 	this_cpu_write(cpu_tlbstate.loaded_mm, next);
 	this_cpu_write(cpu_tlbstate.loaded_mm_asid, new_asid);
-
 	if (rcu_held)
 		rcu_read_unlock();
 
@@ -870,14 +860,12 @@ static void flush_tlb_func(void *info)
 		count_vm_tlb_event(NR_TLB_REMOTE_FLUSH_RECEIVED);
 
 		/* Can only happen on remote CPUs */
-		if (f->mm && f->mm != loaded_mm) {
+		if (f->mm && f->mm != loaded_mm)
 			return;
-		}
 	}
 
-	if (unlikely(loaded_mm == &init_mm)) {
+	if (unlikely(loaded_mm == &init_mm))
 		return;
-	}
 
 	VM_WARN_ON(this_cpu_read(cpu_tlbstate.ctxs[loaded_mm_asid].ctx_id) !=
 		   loaded_mm->context.ctx_id);
@@ -1126,13 +1114,18 @@ void flush_tlb_mm_range(struct mm_struct *mm, unsigned long start,
 	info = get_flush_tlb_info(mm, start, end, stride_shift, freed_tables,
 				  new_tlb_gen);
 
-
 	/*
 	 * flush_tlb_multi() is not optimized for the common case in which only
 	 * a local TLB flush is needed. Optimize this use-case by calling
 	 * flush_tlb_func_local() directly in this case.
 	 */
 	if (cpumask_any_but(mm_cpumask(mm), cpu) < nr_cpu_ids) {
+		long nr_remote = cpumask_weight(mm_cpumask(mm));
+
+		if (cpumask_test_cpu(cpu, mm_cpumask(mm)))
+			nr_remote--;
+		mitosis_stats_tlb(mm, nr_remote);
+
 		flush_tlb_multi(mm_cpumask(mm), info);
 	} else if (mm == this_cpu_read(cpu_tlbstate.loaded_mm)) {
 		lockdep_assert_irqs_enabled();
@@ -1142,7 +1135,6 @@ void flush_tlb_mm_range(struct mm_struct *mm, unsigned long start,
 	}
 
 	put_flush_tlb_info();
-	mitosis_drain_deferred_pages(mm);
 	put_cpu();
 }
 
@@ -1202,6 +1194,9 @@ unsigned long __get_current_cr3_fast(void)
 		build_cr3(this_cpu_read(cpu_tlbstate.loaded_mm)->pgd,
 			  this_cpu_read(cpu_tlbstate.loaded_mm_asid),
 			  tlbstate_lam_cr3_mask());
+
+	pr_emerg("MITOSIS: __get_current_cr3_fast called; it is disabled on this kernel (CR3 may hold a steered replica, not loaded_mm->pgd)\n");
+	BUG();
 
 	/* For now, be very restrictive about when this can be called. */
 	VM_WARN_ON(in_nmi() || preemptible());

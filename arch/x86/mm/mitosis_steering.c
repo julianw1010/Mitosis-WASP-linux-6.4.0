@@ -2,9 +2,8 @@
 #include <linux/cpumask.h>
 #include <linux/smp.h>
 #include <linux/sched.h>
-#include <linux/mempolicy.h>
 #include <asm/tlbflush.h>
-#include <asm/pgtable_repl.h>
+#include <asm/mitosis.h>
 
 struct steering_switch_info {
 	struct mm_struct *mm;
@@ -50,7 +49,7 @@ static void steering_switch_cr3_ipi(void *info)
 	}
 }
 
-void pgtable_repl_force_steering_switch(struct mm_struct *mm,
+void mitosis_force_steering_switch(struct mm_struct *mm,
 					nodemask_t *changed_nodes)
 {
 	struct steering_switch_info switch_info;
@@ -70,8 +69,7 @@ void pgtable_repl_force_steering_switch(struct mm_struct *mm,
 			steering_switch_cr3_ipi(&switch_info);
 		local_irq_restore(flags);
 
-		on_each_cpu_mask(mm_cpumask(mm), steering_switch_cr3_ipi,
-				 &switch_info, 1);
+		on_each_cpu_mask(mm_cpumask(mm), steering_switch_cr3_ipi, &switch_info, 1);
 		return;
 	}
 
@@ -81,60 +79,27 @@ void pgtable_repl_force_steering_switch(struct mm_struct *mm,
 			steering_switch_cr3_ipi(&switch_info);
 		local_irq_restore(flags);
 
-		on_each_cpu_mask(mm_cpumask(mm), steering_switch_cr3_ipi,
-				 &switch_info, 1);
+		on_each_cpu_mask(mm_cpumask(mm), steering_switch_cr3_ipi, &switch_info, 1);
 		return;
 	}
 
 	cpumask_clear(target_cpus);
 	for_each_cpu(cpu, mm_cpumask(mm)) {
 		int node = cpu_to_node(cpu);
-		if (node >= 0 && node < NUMA_NODE_COUNT &&
-		    node_isset(node, *changed_nodes))
+
+		if (node >= 0 && node < NUMA_NODE_COUNT && node_isset(node, *changed_nodes))
 			cpumask_set_cpu(cpu, target_cpus);
 	}
 
 	local_irq_save(flags);
 	if (current->mm == mm || current->active_mm == mm) {
 		int my_node = numa_node_id();
-		if (my_node >= 0 && my_node < NUMA_NODE_COUNT &&
-		    node_isset(my_node, *changed_nodes))
+
+		if (my_node >= 0 && my_node < NUMA_NODE_COUNT && node_isset(my_node, *changed_nodes))
 			steering_switch_cr3_ipi(&switch_info);
 	}
 	local_irq_restore(flags);
 
-	on_each_cpu_mask(target_cpus, steering_switch_cr3_ipi,
-			 &switch_info, 1);
+	on_each_cpu_mask(target_cpus, steering_switch_cr3_ipi, &switch_info, 1);
 	free_cpumask_var(target_cpus);
 }
-EXPORT_SYMBOL(pgtable_repl_force_steering_switch);
-
-int mitosis_interleave_node(struct mm_struct *mm)
-{
-	struct mempolicy *pol;
-	int idx, node, i, num_nodes;
-
-	if (!mm)
-		return -1;
-
-	pol = current->mempolicy;
-	if (!pol || pol->mode != MPOL_INTERLEAVE)
-		return -1;
-
-	num_nodes = nodes_weight(pol->nodes);
-	if (num_nodes <= 1)
-		return -1;
-
-	idx = atomic_inc_return(&mm->pgtable_interleave_counter) - 1;
-	idx = idx % num_nodes;
-
-	i = 0;
-	for_each_node_mask(node, pol->nodes) {
-		if (i == idx)
-			return node;
-		i++;
-	}
-
-	return -1;
-}
-EXPORT_SYMBOL(mitosis_interleave_node);

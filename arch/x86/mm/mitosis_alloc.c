@@ -3,32 +3,14 @@
 #include <linux/page-flags.h>
 #include <linux/string.h>
 #include <asm/pgtable.h>
-#include <asm/pgtable_repl.h>
+#include <asm/pgalloc.h>
+#include <asm/tlb.h>
+#include <asm/mitosis.h>
 #include <asm/io.h>
 #include <asm/cacheflush.h>
+#include <linux/mitosis_stats.h>
 
-struct page *mitosis_alloc_replica_page(int node, int order)
-{
-	struct page *page;
-
-	if (order == 0) {
-		page = mitosis_cache_pop(node, 0);
-		if (page) {
-			BUG_ON(page_to_nid(page) != node);
-			return page;
-		}
-	}
-
-	page = alloc_pages_node(node,
-		GFP_NOWAIT | GFP_ATOMIC | __GFP_ZERO | __GFP_THISNODE, order);
-
-	BUG_ON(!page);
-	BUG_ON(page_to_nid(page) != node);
-
-	return page;
-}
-
-int alloc_pte_replicas(struct page *base_page, struct mm_struct *mm,
+int mitosis_alloc_pte_replicas(struct page *base_page, struct mm_struct *mm,
 		       struct page **pages, int *count)
 {
 	int i;
@@ -57,26 +39,36 @@ int alloc_pte_replicas(struct page *base_page, struct mm_struct *mm,
 	pages[0] = base_page;
 	*count = 1;
 
-	for_each_node_mask(i, nodes_snapshot) {
+	for (i = 0; i < NUMA_NODE_COUNT; i++) {
 		struct page *new_page;
+
+		if (!node_isset(i, nodes_snapshot))
+			continue;
 
 		if (i == base_node)
 			continue;
 
-		new_page = mitosis_alloc_replica_page(i, 0);
+		new_page = mitosis_cache_pop(i, 0, mm);
+		if (!new_page) {
+			new_page = alloc_pages_node(i,
+				GFP_NOWAIT | GFP_ATOMIC | __GFP_ZERO | __GFP_THISNODE, 0);
+			BUG_ON(!new_page);
+		}
 
 		BUG_ON(!pgtable_pte_page_ctor(new_page));
 
 		new_page->pt_owner_mm = mm;
 		mm_inc_nr_ptes(mm);
-		WRITE_ONCE(new_page->pt_replica, NULL);
+		mitosis_pt_account_page(new_page, MITOSIS_CACHE_PTE, 1);
+
+		new_page->pt_replica = NULL;
 		pages[(*count)++] = new_page;
 	}
 
 	return 0;
 }
 
-int alloc_pmd_replicas(struct page *base_page, struct mm_struct *mm,
+int mitosis_alloc_pmd_replicas(struct page *base_page, struct mm_struct *mm,
 		       struct page **pages, int *count)
 {
 	int i;
@@ -105,26 +97,36 @@ int alloc_pmd_replicas(struct page *base_page, struct mm_struct *mm,
 	pages[0] = base_page;
 	*count = 1;
 
-	for_each_node_mask(i, nodes_snapshot) {
+	for (i = 0; i < NUMA_NODE_COUNT; i++) {
 		struct page *new_page;
+
+		if (!node_isset(i, nodes_snapshot))
+			continue;
 
 		if (i == base_node)
 			continue;
 
-		new_page = mitosis_alloc_replica_page(i, 0);
+		new_page = mitosis_cache_pop(i, 0, mm);
+		if (!new_page) {
+			new_page = alloc_pages_node(i,
+				GFP_NOWAIT | GFP_ATOMIC | __GFP_ZERO | __GFP_THISNODE, 0);
+			BUG_ON(!new_page);
+		}
 
 		BUG_ON(!pgtable_pmd_page_ctor(new_page));
 
 		new_page->pt_owner_mm = mm;
 		mm_inc_nr_pmds(mm);
-		WRITE_ONCE(new_page->pt_replica, NULL);
+		mitosis_pt_account_page(new_page, MITOSIS_CACHE_PMD, 1);
+
+		new_page->pt_replica = NULL;
 		pages[(*count)++] = new_page;
 	}
 
 	return 0;
 }
 
-int alloc_pud_replicas(struct page *base_page, struct mm_struct *mm,
+int mitosis_alloc_pud_replicas(struct page *base_page, struct mm_struct *mm,
 		       struct page **pages, int *count)
 {
 	int i;
@@ -153,24 +155,34 @@ int alloc_pud_replicas(struct page *base_page, struct mm_struct *mm,
 	pages[0] = base_page;
 	*count = 1;
 
-	for_each_node_mask(i, nodes_snapshot) {
+	for (i = 0; i < NUMA_NODE_COUNT; i++) {
 		struct page *new_page;
+
+		if (!node_isset(i, nodes_snapshot))
+			continue;
 
 		if (i == base_node)
 			continue;
 
-		new_page = mitosis_alloc_replica_page(i, 0);
+		new_page = mitosis_cache_pop(i, 0, mm);
+		if (!new_page) {
+			new_page = alloc_pages_node(i,
+				GFP_NOWAIT | GFP_ATOMIC | __GFP_ZERO | __GFP_THISNODE, 0);
+			BUG_ON(!new_page);
+		}
 
 		new_page->pt_owner_mm = mm;
 		mm_inc_nr_puds(mm);
-		WRITE_ONCE(new_page->pt_replica, NULL);
+		mitosis_pt_account_page(new_page, MITOSIS_CACHE_PUD, 1);
+
+		new_page->pt_replica = NULL;
 		pages[(*count)++] = new_page;
 	}
 
 	return 0;
 }
 
-int alloc_p4d_replicas(struct page *base_page, struct mm_struct *mm,
+int mitosis_alloc_p4d_replicas(struct page *base_page, struct mm_struct *mm,
 		       struct page **pages, int *count)
 {
 	int i;
@@ -199,34 +211,46 @@ int alloc_p4d_replicas(struct page *base_page, struct mm_struct *mm,
 	pages[0] = base_page;
 	*count = 1;
 
-	for_each_node_mask(i, nodes_snapshot) {
+	for (i = 0; i < NUMA_NODE_COUNT; i++) {
 		struct page *new_page;
+
+		if (!node_isset(i, nodes_snapshot))
+			continue;
 
 		if (i == base_node)
 			continue;
 
-		new_page = mitosis_alloc_replica_page(i, 0);
+		new_page = mitosis_cache_pop(i, 0, mm);
+		if (!new_page) {
+			new_page = alloc_pages_node(i,
+				GFP_NOWAIT | GFP_ATOMIC | __GFP_ZERO | __GFP_THISNODE, 0);
+			BUG_ON(!new_page);
+		}
 
 		new_page->pt_owner_mm = mm;
-		WRITE_ONCE(new_page->pt_replica, NULL);
+		mitosis_pt_account_page(new_page, MITOSIS_CACHE_P4D, 1);
+
+		new_page->pt_replica = NULL;
 		pages[(*count)++] = new_page;
 	}
 
 	return 0;
 }
 
-int alloc_pgd_replicas(struct page *base_page, struct mm_struct *mm,
-		       nodemask_t nodes, struct page **pages, int *count)
+int mitosis_alloc_pgd_replicas(struct page *base_page, struct mm_struct *mm,
+		       struct page **pages, int *count)
 {
 	int i;
 	int base_node;
 	int expected_count;
 	int alloc_order = mitosis_pgd_alloc_order();
+	nodemask_t nodes;
 
 	if (!base_page || !pages || !count)
 		return -EINVAL;
 
 	*count = 0;
+	nodes = node_online_map;
 	expected_count = nodes_weight(nodes);
 	if (expected_count < 2 || expected_count > NUMA_NODE_COUNT)
 		return -EINVAL;
@@ -239,86 +263,115 @@ int alloc_pgd_replicas(struct page *base_page, struct mm_struct *mm,
 	pages[0] = base_page;
 	*count = 1;
 
-	for_each_node_mask(i, nodes) {
+	for (i = 0; i < NUMA_NODE_COUNT; i++) {
 		struct page *new_page;
+
+		if (!node_isset(i, nodes))
+			continue;
 
 		if (i == base_node)
 			continue;
 
-		new_page = mitosis_alloc_replica_page(i, alloc_order);
+		new_page = NULL;
+		if (alloc_order == 0)
+			new_page = mitosis_cache_pop(i, 0, mm);
+		if (!new_page) {
+			new_page = alloc_pages_node(i,
+				GFP_NOWAIT | GFP_ATOMIC | __GFP_ZERO | __GFP_THISNODE,
+				alloc_order);
+			BUG_ON(!new_page);
+		}
 
 		new_page->pt_owner_mm = mm;
 		if (mm)
-		WRITE_ONCE(new_page->pt_replica, NULL);
+			new_page->pt_replica = NULL;
 		pages[(*count)++] = new_page;
 	}
 
 	return 0;
 }
 
-int free_replica_chain_safe(struct page *primary_page,
-			    const char *level_name, int order)
+int mitosis_free_replica_chain(struct page *primary, int level, int order,
+			       struct mmu_gather *tlb)
 {
-	struct page *cur_page;
-	struct page *next_page;
-	struct page *start_page;
+	struct page *cur_page, *next_page, *start_page;
 	struct page *pages_to_free[NUMA_NODE_COUNT];
 	int free_count = 0;
 	int i;
 
-	if (!primary_page)
+	if (!primary)
 		return 0;
 
-	cur_page = xchg(&primary_page->pt_replica, NULL);
+	cur_page = xchg(&primary->pt_replica, NULL);
 	if (!cur_page)
 		return 0;
 
-	start_page = primary_page;
+	start_page = primary;
 
 	while (cur_page && cur_page != start_page && free_count < NUMA_NODE_COUNT) {
 		pages_to_free[free_count++] = cur_page;
-		next_page = READ_ONCE(cur_page->pt_replica);
-		WRITE_ONCE(cur_page->pt_replica, NULL);
+		next_page = cur_page->pt_replica;
+		cur_page->pt_replica = NULL;
 		cur_page = next_page;
 	}
 
-	smp_mb();
-
 	for (i = 0; i < free_count; i++) {
-		struct mm_struct *owner_mm = pages_to_free[i]->pt_owner_mm;
-		int nid = page_to_nid(pages_to_free[i]);
-		bool from_cache = PageMitosisFromCache(pages_to_free[i]);
+		struct page *p = pages_to_free[i];
+		struct mm_struct *owner_mm = p->pt_owner_mm;
 
-		if (strcmp(level_name, "pte") == 0) {
-			pgtable_pte_page_dtor(pages_to_free[i]);
-			if (owner_mm)
+		mitosis_pt_account_mm(owner_mm, page_to_nid(p), level, -1);
+
+		if (level == MITOSIS_CACHE_PTE)
+			pgtable_pte_page_dtor(p);
+		else if (level == MITOSIS_CACHE_PMD)
+			pgtable_pmd_page_dtor(p);
+
+		if (owner_mm) {
+			if (level == MITOSIS_CACHE_PTE)
 				mm_dec_nr_ptes(owner_mm);
-		} else if (strcmp(level_name, "pmd") == 0) {
-			pgtable_pmd_page_dtor(pages_to_free[i]);
-			if (owner_mm)
+			else if (level == MITOSIS_CACHE_PMD)
 				mm_dec_nr_pmds(owner_mm);
-		} else if (strcmp(level_name, "pud") == 0) {
-			if (owner_mm)
+			else if (level == MITOSIS_CACHE_PUD)
 				mm_dec_nr_puds(owner_mm);
 		}
 
-		pages_to_free[i]->pt_owner_mm = NULL;
-
-		if (order == 0 && from_cache) {
-			ClearPageMitosisFromCache(pages_to_free[i]);
-			pages_to_free[i]->pt_replica = NULL;
-			if (mitosis_cache_push(pages_to_free[i], nid, 0))
+		if (tlb) {
+			if (PageMitosisFromCache(p)) {
+				mitosis_cache_defer(tlb, p);
 				continue;
+			}
+			p->pt_owner_mm = NULL;
+			tlb_remove_page(tlb, p);
+			continue;
 		}
 
-		ClearPageMitosisFromCache(pages_to_free[i]);
-		__free_pages(pages_to_free[i], order);
+		if (order == 0) {
+			int nid = page_to_nid(p);
+			bool from_cache = PageMitosisFromCache(p);
+
+			p->pt_owner_mm = NULL;
+			ClearPageMitosisFromCache(p);
+
+			if (from_cache) {
+				p->pt_replica = NULL;
+				if (mitosis_cache_push(p, nid, level, owner_mm))
+					continue;
+			}
+		}
+
+		ClearPageMitosisFromCache(p);
+		p->pt_owner_mm = NULL;
+		__free_pages(p, order);
 	}
 
 	return free_count;
 }
 
-void pgtable_repl_alloc_pte(struct mm_struct *mm, unsigned long pfn)
+typedef int (*alloc_replicas_fn_t)(struct page *, struct mm_struct *,
+				   struct page **, int *);
+
+static void mitosis_alloc_common(struct mm_struct *mm, unsigned long pfn,
+				      alloc_replicas_fn_t alloc_fn)
 {
 	struct page *base_page;
 	struct page *pages[NUMA_NODE_COUNT];
@@ -331,382 +384,71 @@ void pgtable_repl_alloc_pte(struct mm_struct *mm, unsigned long pfn)
 
 	base_page = pfn_to_page(pfn);
 
-	if (!smp_load_acquire(&mm->repl_pgd_enabled))
-		return;
-
-	if (READ_ONCE(base_page->pt_replica))
+	if (!mm->repl_pgd_enabled || base_page->pt_replica)
 		return;
 
 	src_addr = page_address(base_page);
-	ret = alloc_pte_replicas(base_page, mm, pages, &count);
+	ret = alloc_fn(base_page, mm, pages, &count);
 	if (ret != 0 || count < 2)
 		return;
 
-	for (i = 1; i < count; i++) {
+	for (i = 1; i < count; i++)
 		memcpy(page_address(pages[i]), src_addr, PAGE_SIZE);
-		clflush_cache_range(page_address(pages[i]), PAGE_SIZE);
-	}
 
-	if (unlikely(!smp_load_acquire(&mm->repl_pgd_enabled))) {
-		for (i = 1; i < count; i++) {
-			pgtable_pte_page_dtor(pages[i]);
-			mm_dec_nr_ptes(mm);
-			pages[i]->pt_owner_mm = NULL;
-			__free_page(pages[i]);
-		}
-		return;
-	}
-
-	if (unlikely(!link_page_replicas(pages, count))) {
-		for (i = 1; i < count; i++) {
-			pgtable_pte_page_dtor(pages[i]);
-			mm_dec_nr_ptes(mm);
-			pages[i]->pt_owner_mm = NULL;
-			__free_page(pages[i]);
-		}
-		return;
-	}
+	mitosis_link_page_replicas(pages, count);
 }
-EXPORT_SYMBOL(pgtable_repl_alloc_pte);
 
-void pgtable_repl_alloc_pmd(struct mm_struct *mm, unsigned long pfn)
+void mitosis_alloc_pte(struct mm_struct *mm, unsigned long pfn)
 {
-	struct page *base_page;
-	struct page *pages[NUMA_NODE_COUNT];
-	void *src_addr;
-	int count = 0;
-	int i, ret;
-
-	if (!mm || !pfn_valid(pfn))
-		return;
-
-	base_page = pfn_to_page(pfn);
-
-	if (!smp_load_acquire(&mm->repl_pgd_enabled))
-		return;
-
-	if (READ_ONCE(base_page->pt_replica))
-		return;
-
-	src_addr = page_address(base_page);
-	ret = alloc_pmd_replicas(base_page, mm, pages, &count);
-	if (ret != 0 || count < 2)
-		return;
-
-	for (i = 1; i < count; i++) {
-		memcpy(page_address(pages[i]), src_addr, PAGE_SIZE);
-		clflush_cache_range(page_address(pages[i]), PAGE_SIZE);
-	}
-
-	if (unlikely(!smp_load_acquire(&mm->repl_pgd_enabled))) {
-		for (i = 1; i < count; i++) {
-			pgtable_pmd_page_dtor(pages[i]);
-			mm_dec_nr_pmds(mm);
-			pages[i]->pt_owner_mm = NULL;
-			__free_page(pages[i]);
-		}
-		return;
-	}
-
-	if (unlikely(!link_page_replicas(pages, count))) {
-		for (i = 1; i < count; i++) {
-			pgtable_pmd_page_dtor(pages[i]);
-			mm_dec_nr_pmds(mm);
-			pages[i]->pt_owner_mm = NULL;
-			__free_page(pages[i]);
-		}
-		return;
-	}
+	mitosis_alloc_common(mm, pfn, mitosis_alloc_pte_replicas);
 }
-EXPORT_SYMBOL(pgtable_repl_alloc_pmd);
 
-void pgtable_repl_alloc_pud(struct mm_struct *mm, unsigned long pfn)
+void mitosis_alloc_pmd(struct mm_struct *mm, unsigned long pfn)
 {
-	struct page *base_page;
-	struct page *pages[NUMA_NODE_COUNT];
-	void *src_addr;
-	int count = 0;
-	int i, ret;
-
-	if (!mm || !pfn_valid(pfn))
-		return;
-
-	base_page = pfn_to_page(pfn);
-
-	if (!smp_load_acquire(&mm->repl_pgd_enabled))
-		return;
-
-	if (READ_ONCE(base_page->pt_replica))
-		return;
-
-	src_addr = page_address(base_page);
-	ret = alloc_pud_replicas(base_page, mm, pages, &count);
-	if (ret != 0 || count < 2)
-		return;
-
-	for (i = 1; i < count; i++) {
-		memcpy(page_address(pages[i]), src_addr, PAGE_SIZE);
-		clflush_cache_range(page_address(pages[i]), PAGE_SIZE);
-	}
-
-	if (unlikely(!smp_load_acquire(&mm->repl_pgd_enabled))) {
-		for (i = 1; i < count; i++) {
-			mm_dec_nr_puds(mm);
-			pages[i]->pt_owner_mm = NULL;
-			__free_page(pages[i]);
-		}
-		return;
-	}
-
-	if (unlikely(!link_page_replicas(pages, count))) {
-		for (i = 1; i < count; i++) {
-			mm_dec_nr_puds(mm);
-			pages[i]->pt_owner_mm = NULL;
-			__free_page(pages[i]);
-		}
-		return;
-	}
+	mitosis_alloc_common(mm, pfn, mitosis_alloc_pmd_replicas);
 }
-EXPORT_SYMBOL(pgtable_repl_alloc_pud);
 
-void pgtable_repl_alloc_p4d(struct mm_struct *mm, unsigned long pfn)
+void mitosis_alloc_pud(struct mm_struct *mm, unsigned long pfn)
 {
-	struct page *base_page;
-	struct page *pages[NUMA_NODE_COUNT];
-	void *src_addr;
-	int count = 0;
-	int i, ret;
-
-	if (!pgtable_l5_enabled() || !mm || !pfn_valid(pfn))
-		return;
-
-	base_page = pfn_to_page(pfn);
-
-	if (!smp_load_acquire(&mm->repl_pgd_enabled))
-		return;
-
-	if (READ_ONCE(base_page->pt_replica))
-		return;
-
-	src_addr = page_address(base_page);
-	ret = alloc_p4d_replicas(base_page, mm, pages, &count);
-	if (ret != 0 || count < 2)
-		return;
-
-	for (i = 1; i < count; i++) {
-		memcpy(page_address(pages[i]), src_addr, PAGE_SIZE);
-		clflush_cache_range(page_address(pages[i]), PAGE_SIZE);
-	}
-
-	if (unlikely(!smp_load_acquire(&mm->repl_pgd_enabled))) {
-		for (i = 1; i < count; i++) {
-			pages[i]->pt_owner_mm = NULL;
-			__free_page(pages[i]);
-		}
-		return;
-	}
-
-	if (unlikely(!link_page_replicas(pages, count))) {
-		for (i = 1; i < count; i++) {
-			pages[i]->pt_owner_mm = NULL;
-			__free_page(pages[i]);
-		}
-		return;
-	}
+	mitosis_alloc_common(mm, pfn, mitosis_alloc_pud_replicas);
 }
-EXPORT_SYMBOL(pgtable_repl_alloc_p4d);
 
-void pgtable_repl_release_pte(struct mm_struct *mm, unsigned long pfn)
+void mitosis_alloc_p4d(struct mm_struct *mm, unsigned long pfn)
 {
-	struct page *page;
-	struct page *cur_page, *next_page, *start_page;
-	struct page *pages_to_free[NUMA_NODE_COUNT];
-	int free_count = 0;
-	int i;
+	if (!pgtable_l5_enabled())
+		return;
 
+	mitosis_alloc_common(mm, pfn, mitosis_alloc_p4d_replicas);
+}
+
+void mitosis_release_pte(unsigned long pfn)
+{
 	if (!pfn_valid(pfn))
 		return;
 
-	page = pfn_to_page(pfn);
-
-	cur_page = xchg(&page->pt_replica, NULL);
-	if (!cur_page)
-		return;
-
-	start_page = page;
-
-	while (cur_page && cur_page != start_page && free_count < NUMA_NODE_COUNT) {
-		pages_to_free[free_count++] = cur_page;
-		next_page = READ_ONCE(cur_page->pt_replica);
-		WRITE_ONCE(cur_page->pt_replica, NULL);
-		cur_page = next_page;
-	}
-
-	for (i = 0; i < free_count; i++) {
-		struct mm_struct *owner_mm = pages_to_free[i]->pt_owner_mm;
-		int nid = page_to_nid(pages_to_free[i]);
-		bool from_cache = PageMitosisFromCache(pages_to_free[i]);
-
-
-		pgtable_pte_page_dtor(pages_to_free[i]);
-		if (owner_mm)
-			mm_dec_nr_ptes(owner_mm);
-		pages_to_free[i]->pt_owner_mm = NULL;
-
-		if (from_cache) {
-			ClearPageMitosisFromCache(pages_to_free[i]);
-			pages_to_free[i]->pt_replica = NULL;
-			if (mitosis_cache_push(pages_to_free[i], nid, 0))
-				continue;
-		}
-
-		ClearPageMitosisFromCache(pages_to_free[i]);
-		__free_page(pages_to_free[i]);
-	}
+	mitosis_free_replica_chain(pfn_to_page(pfn), MITOSIS_CACHE_PTE, 0, NULL);
 }
-EXPORT_SYMBOL(pgtable_repl_release_pte);
 
-void pgtable_repl_release_pmd(struct mm_struct *mm, unsigned long pfn)
+void mitosis_release_pmd(unsigned long pfn)
 {
-	struct page *page;
-	struct page *cur_page, *next_page, *start_page;
-	struct page *pages_to_free[NUMA_NODE_COUNT];
-	int free_count = 0;
-	int i;
-
 	if (!pfn_valid(pfn))
 		return;
 
-	page = pfn_to_page(pfn);
-
-	cur_page = xchg(&page->pt_replica, NULL);
-	if (!cur_page)
-		return;
-
-	start_page = page;
-
-	while (cur_page && cur_page != start_page && free_count < NUMA_NODE_COUNT) {
-		pages_to_free[free_count++] = cur_page;
-		next_page = READ_ONCE(cur_page->pt_replica);
-		WRITE_ONCE(cur_page->pt_replica, NULL);
-		cur_page = next_page;
-	}
-
-	for (i = 0; i < free_count; i++) {
-		struct mm_struct *owner_mm = pages_to_free[i]->pt_owner_mm;
-		int nid = page_to_nid(pages_to_free[i]);
-		bool from_cache = PageMitosisFromCache(pages_to_free[i]);
-
-
-		pgtable_pmd_page_dtor(pages_to_free[i]);
-		if (owner_mm)
-			mm_dec_nr_pmds(owner_mm);
-		pages_to_free[i]->pt_owner_mm = NULL;
-
-		if (from_cache) {
-			ClearPageMitosisFromCache(pages_to_free[i]);
-			pages_to_free[i]->pt_replica = NULL;
-			if (mitosis_cache_push(pages_to_free[i], nid, 0))
-				continue;
-		}
-
-		ClearPageMitosisFromCache(pages_to_free[i]);
-		__free_page(pages_to_free[i]);
-	}
+	mitosis_free_replica_chain(pfn_to_page(pfn), MITOSIS_CACHE_PMD, 0, NULL);
 }
-EXPORT_SYMBOL(pgtable_repl_release_pmd);
 
-void pgtable_repl_release_pud(struct mm_struct *mm, unsigned long pfn)
+void mitosis_release_pud(unsigned long pfn)
 {
-	struct page *page;
-	struct page *cur_page, *next_page, *start_page;
-	struct page *pages_to_free[NUMA_NODE_COUNT];
-	int free_count = 0;
-	int i;
-
 	if (!pfn_valid(pfn))
 		return;
 
-	page = pfn_to_page(pfn);
-
-	cur_page = xchg(&page->pt_replica, NULL);
-	if (!cur_page)
-		return;
-
-	start_page = page;
-
-	while (cur_page && cur_page != start_page && free_count < NUMA_NODE_COUNT) {
-		pages_to_free[free_count++] = cur_page;
-		next_page = READ_ONCE(cur_page->pt_replica);
-		WRITE_ONCE(cur_page->pt_replica, NULL);
-		cur_page = next_page;
-	}
-
-	for (i = 0; i < free_count; i++) {
-		struct mm_struct *owner_mm = pages_to_free[i]->pt_owner_mm;
-		int nid = page_to_nid(pages_to_free[i]);
-		bool from_cache = PageMitosisFromCache(pages_to_free[i]);
-
-
-		if (owner_mm)
-			mm_dec_nr_puds(owner_mm);
-		pages_to_free[i]->pt_owner_mm = NULL;
-
-		if (from_cache) {
-			ClearPageMitosisFromCache(pages_to_free[i]);
-			pages_to_free[i]->pt_replica = NULL;
-			if (mitosis_cache_push(pages_to_free[i], nid, 0))
-				continue;
-		}
-
-		ClearPageMitosisFromCache(pages_to_free[i]);
-		__free_page(pages_to_free[i]);
-	}
+	mitosis_free_replica_chain(pfn_to_page(pfn), MITOSIS_CACHE_PUD, 0, NULL);
 }
-EXPORT_SYMBOL(pgtable_repl_release_pud);
 
-void pgtable_repl_release_p4d(struct mm_struct *mm, unsigned long pfn)
+void mitosis_release_p4d(unsigned long pfn)
 {
-	struct page *page;
-	struct page *cur_page, *next_page, *start_page;
-	struct page *pages_to_free[NUMA_NODE_COUNT];
-	int free_count = 0;
-	int i;
-
 	if (!pgtable_l5_enabled() || !pfn_valid(pfn))
 		return;
 
-	page = pfn_to_page(pfn);
-
-	cur_page = xchg(&page->pt_replica, NULL);
-	if (!cur_page)
-		return;
-
-	start_page = page;
-
-	while (cur_page && cur_page != start_page && free_count < NUMA_NODE_COUNT) {
-		pages_to_free[free_count++] = cur_page;
-		next_page = READ_ONCE(cur_page->pt_replica);
-		WRITE_ONCE(cur_page->pt_replica, NULL);
-		cur_page = next_page;
-	}
-
-	for (i = 0; i < free_count; i++) {
-		int nid = page_to_nid(pages_to_free[i]);
-		bool from_cache = PageMitosisFromCache(pages_to_free[i]);
-
-
-		pages_to_free[i]->pt_owner_mm = NULL;
-
-		if (from_cache) {
-			ClearPageMitosisFromCache(pages_to_free[i]);
-			pages_to_free[i]->pt_replica = NULL;
-			if (mitosis_cache_push(pages_to_free[i], nid, 0))
-				continue;
-		}
-
-		ClearPageMitosisFromCache(pages_to_free[i]);
-		__free_page(pages_to_free[i]);
-	}
+	mitosis_free_replica_chain(pfn_to_page(pfn), MITOSIS_CACHE_P4D, 0, NULL);
 }
-EXPORT_SYMBOL(pgtable_repl_release_p4d);

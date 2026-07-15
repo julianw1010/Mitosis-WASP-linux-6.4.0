@@ -111,7 +111,8 @@
 #define CREATE_TRACE_POINTS
 #include <trace/events/task.h>
 
-#include <asm/pgtable_repl.h>
+#include <asm/mitosis.h>
+#include <linux/mitosis_stats.h>
 
 /*
  * Minimum number of threads to boot the kernel
@@ -924,6 +925,7 @@ void __mmdrop(struct mm_struct *mm)
 
 	WARN_ON_ONCE(mm == current->active_mm);
 	mm_free_pgd(mm);
+	mitosis_stats_retire(mm);
 	destroy_context(mm);
 	mmu_notifier_subscriptions_destroy(mm);
 	check_mm(mm);
@@ -1258,6 +1260,7 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
 	struct user_namespace *user_ns)
 {
 	int i;
+
 	mt_init_flags(&mm->mm_mt, MM_MT_FLAGS);
 	mt_set_external_lock(&mm->mm_mt, &mm->mmap_lock);
 	atomic_set(&mm->mm_users, 1);
@@ -1287,6 +1290,7 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
 #endif
 	mm_init_uprobes_state(mm);
 	hugetlb_count_init(mm);
+
 	if (current->mm) {
 		mm->flags = current->mm->flags & MMF_INIT_MASK;
 		mm->def_flags = current->mm->def_flags & VM_INIT_DEF_MASK;
@@ -1296,34 +1300,36 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
 	}
 
 	mm->repl_pgd_enabled = false;
-	mm->repl_in_progress = false;
 	mm->repl_pending_enable = false;
 	mm->cache_only_mode = false;
+	mm->mitosis_stats = NULL;
 	nodes_clear(mm->repl_pgd_nodes);
-	nodes_clear(mm->repl_pending_nodes);
 	mutex_init(&mm->repl_mutex);
-	spin_lock_init(&mm->repl_alloc_lock);
-	spin_lock_init(&mm->mitosis_deferred_lock);
-	mm->mitosis_deferred_pages = NULL;
-	atomic_set(&mm->pgtable_interleave_counter, 0);
+
 	memset(mm->pgd_replicas, 0, sizeof(mm->pgd_replicas));
-	mm->original_pgd = NULL;
 	for (int i = 0; i < NUMA_NODE_COUNT; i++) {
 		mm->repl_steering[i] = -1;
 	}
 
 	if (mm_alloc_pgd(mm))
 		goto fail_nopgd;
+
 	if (init_new_context(p, mm))
 		goto fail_nocontext;
+
 	if (mm_alloc_cid(mm))
 		goto fail_cid;
+
 	for (i = 0; i < NR_MM_COUNTERS; i++)
 		if (percpu_counter_init(&mm->rss_stat[i], 0, GFP_KERNEL_ACCOUNT))
 			goto fail_pcpu;
+
 	mm->user_ns = get_user_ns(user_ns);
 	lru_gen_init_mm(mm);
-	
+
+	mitosis_stats_birth(mm);
+	mitosis_pt_account_page(virt_to_page(mm->pgd), MITOSIS_CACHE_PGD, 1);
+
 	return mm;
 
 fail_pcpu:
@@ -1373,6 +1379,7 @@ static inline void __mmput(struct mm_struct *mm)
 	if (mm->binfmt)
 		module_put(mm->binfmt->module);
 	lru_gen_del_mm(mm);
+	mitosis_stats_publish(mm);
 	mmdrop(mm);
 }
 
@@ -1387,13 +1394,12 @@ void mmput(struct mm_struct *mm)
 		bool repl = mm->repl_pgd_enabled;
 
 		if (repl) {
-			WARN_ON_ONCE(atomic_read(&mm->mm_users) != 0);
+			BUG_ON(atomic_read(&mm->mm_users) != 0);
 			synchronize_rcu();
-			pgtable_repl_disable(mm);
-			WARN_ON_ONCE(mm->repl_pgd_enabled);
-			WARN_ON_ONCE(!nodes_empty(mm->repl_pgd_nodes));
+			mitosis_disable(mm);
+			BUG_ON(mm->repl_pgd_enabled);
+			BUG_ON(!nodes_empty(mm->repl_pgd_nodes));
 		}
-		mitosis_drain_deferred_pages(mm);
 		__mmput(mm);
 	}
 }
@@ -1704,8 +1710,7 @@ static struct mm_struct *dup_mm(struct task_struct *tsk,
 {
 	struct mm_struct *mm;
 	int err;
-    bool saved_cache_only_mode = oldmm->cache_only_mode;
-
+	bool saved_cache_only_mode = oldmm->cache_only_mode;
 
 	mm = allocate_mm();
 	if (!mm)
@@ -1715,8 +1720,8 @@ static struct mm_struct *dup_mm(struct task_struct *tsk,
 
 	if (!mm_init(mm, tsk, mm->user_ns))
 		goto fail_nomem;
-		
-   mm->cache_only_mode = saved_cache_only_mode;
+
+	mm->cache_only_mode = saved_cache_only_mode;
 
 	err = dup_mmap(mm, oldmm);
 	if (err)
@@ -1768,29 +1773,19 @@ static int copy_mm(unsigned long clone_flags, struct task_struct *tsk)
 		mm = oldmm;
 	} else {
 		bool parent_had_mitosis = false;
-		nodemask_t saved_nodes;
 
-		nodes_clear(saved_nodes);
-
-		mutex_lock(&oldmm->repl_mutex);
-		if (oldmm->repl_pgd_enabled &&
+		if (smp_load_acquire(&oldmm->repl_pgd_enabled) &&
 		    !nodes_empty(oldmm->repl_pgd_nodes) &&
 		    nodes_weight(oldmm->repl_pgd_nodes) >= 2) {
 			parent_had_mitosis = true;
-			saved_nodes = oldmm->repl_pgd_nodes;
 		}
-		mutex_unlock(&oldmm->repl_mutex);
 
 		mm = dup_mm(tsk, oldmm);
 		if (!mm)
 			return -ENOMEM;
 
 		if (sysctl_mitosis_inherit == 1 && parent_had_mitosis) {
-			pgtable_repl_enable(mm, saved_nodes);
-		} else if (sysctl_mitosis_mode == 1 &&
-			   !(tsk->flags & PF_KTHREAD) &&
-			   num_online_nodes() >= 2) {
-			pgtable_repl_enable(mm, node_online_map);
+			mitosis_enable(mm);
 		}
 	}
 
@@ -2627,6 +2622,9 @@ __latent_entropy struct task_struct *copy_process(
 		p->group_leader = p;
 		p->tgid = p->pid;
 	}
+
+	if (p->mm && !(clone_flags & CLONE_VM) && p->mm->repl_pgd_enabled)
+		mitosis_stats_stamp(p->mm, p);
 
 	p->nr_dirtied = 0;
 	p->nr_dirtied_pause = 128 >> (PAGE_SHIFT - 10);
