@@ -20,7 +20,14 @@
  */
 static inline pte_t *__pte_alloc_one_kernel(struct mm_struct *mm)
 {
-	return (pte_t *)__get_free_page(GFP_PGTABLE_KERNEL);
+	pte_t *pte = (pte_t *)__get_free_page(GFP_PGTABLE_KERNEL);
+
+	if (!pte)
+		return NULL;
+
+	virt_to_page(pte)->pt_replica = NULL;
+	virt_to_page(pte)->pt_owner_mm = NULL;
+	return pte;
 }
 
 #ifndef __HAVE_ARCH_PTE_ALLOC_ONE_KERNEL

@@ -429,60 +429,25 @@ static inline void _pgd_free(struct mm_struct *mm, pgd_t *pgd)
 
 static inline pgd_t *_pgd_alloc(struct mm_struct *mm)
 {
-	int order = PGD_ALLOCATION_ORDER;
-	struct page *page;
-	pgd_t *pgd;
+	pgd_t *pgd = (pgd_t *)__get_free_pages(GFP_PGTABLE_USER,
+					       PGD_ALLOCATION_ORDER);
 
-	if (mm && mm != &init_mm && mm->repl_pgd_enabled) {
-		int node = numa_node_id();
+	if (!pgd)
+		return NULL;
 
-		page = NULL;
-		if (order == 0)
-			page = mitosis_cache_pop(node, MITOSIS_CACHE_PGD, mm);
-		if (!page)
-			page = alloc_pages_node(node,
-						GFP_PGTABLE_USER | __GFP_THISNODE,
-						order);
-		if (!page)
-			return NULL;
-		pgd = (pgd_t *)page_address(page);
-	} else {
-		pgd = (pgd_t *)__get_free_pages(GFP_PGTABLE_USER, order);
-		if (!pgd)
-			return NULL;
-		page = virt_to_page(pgd);
-	}
-
-	page->pt_replica = NULL;
-	page->pt_owner_mm = mm;
+	virt_to_page(pgd)->pt_replica = NULL;
+	virt_to_page(pgd)->pt_owner_mm = mm;
 	return pgd;
 }
 
 static inline void _pgd_free(struct mm_struct *mm, pgd_t *pgd)
 {
 	struct page *page = virt_to_page(pgd);
-	int order = PGD_ALLOCATION_ORDER;
 
 	mitosis_pt_account_page(page, MITOSIS_CACHE_PGD, -1);
+	page->pt_owner_mm = NULL;
 
-	if (order == 0) {
-		int nid = page_to_nid(page);
-		bool from_cache = PageMitosisFromCache(page);
-
-		page->pt_owner_mm = NULL;
-		ClearPageMitosisFromCache(page);
-
-		if (from_cache) {
-			page->pt_replica = NULL;
-			if (mitosis_cache_push(page, nid, MITOSIS_CACHE_PGD, mm))
-				return;
-		}
-	} else {
-		page->pt_owner_mm = NULL;
-		ClearPageMitosisFromCache(page);
-	}
-
-	free_pages((unsigned long)pgd, order);
+	free_pages((unsigned long)pgd, PGD_ALLOCATION_ORDER);
 }
 #endif /* CONFIG_X86_PAE */
 
