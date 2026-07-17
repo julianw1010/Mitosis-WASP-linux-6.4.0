@@ -38,6 +38,7 @@ void mitosis_stats_publish(struct mm_struct *mm);
 void mitosis_stats_retire(struct mm_struct *mm);
 int mitosis_status_open(struct inode *inode, struct file *file);
 int mitosis_history_open(struct inode *inode, struct file *file);
+int mitosis_stats_clear_history(void);
 
 static inline void mitosis_stats_thp_split(struct mm_struct *mm)
 {
