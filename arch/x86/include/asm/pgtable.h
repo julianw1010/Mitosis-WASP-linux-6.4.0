@@ -1134,7 +1134,10 @@ static inline pmd_t pmdp_huge_get_and_clear(struct mm_struct *mm, unsigned long 
 static inline pud_t pudp_huge_get_and_clear(struct mm_struct *mm,
 					unsigned long addr, pud_t *pudp)
 {
-	pud_t pud = native_pudp_get_and_clear(pudp);
+	pud_t pud;
+
+	mitosis_stats_pt_write(pudp, MITOSIS_CACHE_PUD);
+	pud = native_pudp_get_and_clear(pudp);
 
 	page_table_check_pud_clear(mm, addr, pud);
 

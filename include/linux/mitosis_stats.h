@@ -24,6 +24,16 @@ struct mitosis_stats {
 
 	atomic_long_t tlb_shootdowns;
 
+	atomic_long_t faults;
+	atomic_long_t faults_write;
+	atomic_long_t faults_present;
+	atomic_long_t faults_node[NUMA_NODE_COUNT];
+
+	atomic_long_t pt_writes[MITOSIS_PT_NR_LEVELS];
+
+	unsigned long start_jiffies;
+	unsigned long end_jiffies;
+
 	atomic_long_t numa_migrate_4k[NUMA_NODE_COUNT][NUMA_NODE_COUNT];
 	atomic_long_t numa_migrate_2m[NUMA_NODE_COUNT][NUMA_NODE_COUNT];
 
@@ -36,6 +46,7 @@ struct mitosis_stats *mitosis_stats_attach(struct mm_struct *mm, int master_node
 void mitosis_stats_stamp(struct mm_struct *mm, struct task_struct *tsk);
 void mitosis_stats_publish(struct mm_struct *mm);
 void mitosis_stats_retire(struct mm_struct *mm);
+void mitosis_stats_fault(struct mm_struct *mm, unsigned int flags);
 int mitosis_status_open(struct inode *inode, struct file *file);
 int mitosis_history_open(struct inode *inode, struct file *file);
 int mitosis_stats_clear_history(void);
