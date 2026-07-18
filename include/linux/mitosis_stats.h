@@ -30,6 +30,7 @@ struct mitosis_stats {
 	atomic_long_t faults_node[NUMA_NODE_COUNT];
 
 	atomic_long_t pt_writes[MITOSIS_PT_NR_LEVELS];
+	atomic_long_t pt_pages[MITOSIS_PT_NR_LEVELS];
 
 	unsigned long start_jiffies;
 	unsigned long end_jiffies;

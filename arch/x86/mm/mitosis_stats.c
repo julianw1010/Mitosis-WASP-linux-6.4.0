@@ -186,6 +186,18 @@ void mitosis_stats_fault(struct mm_struct *mm, unsigned int flags)
 		atomic_long_inc(&s->faults_node[node]);
 }
 
+static long mitosis_ring_len(struct page *base)
+{
+	struct page *cur = base->pt_replica;
+	long n = 1;
+
+	while (cur && cur != base) {
+		n++;
+		cur = cur->pt_replica;
+	}
+	return n;
+}
+
 void mitosis_stats_pt_write(void *tablep, int level)
 {
 	struct page *page;
@@ -208,8 +220,10 @@ void mitosis_stats_pt_write(void *tablep, int level)
 		return;
 
 	s = mm->mitosis_stats;
-	if (s)
+	if (s) {
 		atomic_long_inc(&s->pt_writes[level]);
+		atomic_long_add(mitosis_ring_len(page), &s->pt_pages[level]);
+	}
 }
 
 static const char * const mitosis_level_name[MITOSIS_PT_NR_LEVELS] = {
@@ -342,17 +356,26 @@ static void mitosis_stats_print(struct seq_file *m, struct mitosis_stats *s,
 		seq_putc(m, '\n');
 	}
 
-	mitosis_print_section(m, "Page-table entry writes (all levels)");
-	mitosis_print_kv(m, "PGD entry writes",
-			 atomic_long_read(&s->pt_writes[MITOSIS_CACHE_PGD]));
-	mitosis_print_kv(m, "P4D entry writes",
-			 atomic_long_read(&s->pt_writes[MITOSIS_CACHE_P4D]));
-	mitosis_print_kv(m, "PUD entry writes",
-			 atomic_long_read(&s->pt_writes[MITOSIS_CACHE_PUD]));
-	mitosis_print_kv(m, "PMD entry writes",
-			 atomic_long_read(&s->pt_writes[MITOSIS_CACHE_PMD]));
-	mitosis_print_kv(m, "PTE entry writes",
-			 atomic_long_read(&s->pt_writes[MITOSIS_CACHE_PTE]));
+	{
+		char buf[24];
+		int lvl;
+
+		mitosis_print_section(m,
+			"Page-table entry modifications + replica fan-out (all ops)  [rows = level]");
+		seq_puts(m,
+			 "  (writes = set/clear/wrprotect/young calls; pages = replica table pages touched)\n");
+		seq_printf(m, "      %-6s %14s %14s %16s\n",
+			   "level", "writes", "pages", "avg pages/write");
+		for (lvl = MITOSIS_CACHE_PGD; lvl >= MITOSIS_CACHE_PTE; lvl--) {
+			long writes = atomic_long_read(&s->pt_writes[lvl]);
+			long pages = atomic_long_read(&s->pt_pages[lvl]);
+			long h = writes ? (pages * 100 + writes / 2) / writes : 0;
+
+			scnprintf(buf, sizeof(buf), "%ld.%02ld", h / 100, h % 100);
+			seq_printf(m, "      %-6s %14ld %14ld %16s\n",
+				   mitosis_level_name[lvl], writes, pages, buf);
+		}
+	}
 
 	mitosis_print_section(m, "TLB shootdowns (remote-CPU IPIs)");
 	mitosis_print_kv(m, "Total shootdowns",
