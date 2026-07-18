@@ -170,4 +170,5 @@ int mitosis_free_replica_chain(struct page *primary, int level, int order,
 void mitosis_pt_account_mm(struct mm_struct *mm, int node, int level, int delta);
 void mitosis_pt_account_page(struct page *page, int level, int delta);
 void mitosis_stats_pt_write(void *tablep, int level);
+void mitosis_stats_pt_pages(void *tablep, int level, long pages);
 #endif

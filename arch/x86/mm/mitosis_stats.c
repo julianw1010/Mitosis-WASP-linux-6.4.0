@@ -186,18 +186,6 @@ void mitosis_stats_fault(struct mm_struct *mm, unsigned int flags)
 		atomic_long_inc(&s->faults_node[node]);
 }
 
-static long mitosis_ring_len(struct page *base)
-{
-	struct page *cur = base->pt_replica;
-	long n = 1;
-
-	while (cur && cur != base) {
-		n++;
-		cur = cur->pt_replica;
-	}
-	return n;
-}
-
 void mitosis_stats_pt_write(void *tablep, int level)
 {
 	struct page *page;
@@ -220,10 +208,34 @@ void mitosis_stats_pt_write(void *tablep, int level)
 		return;
 
 	s = mm->mitosis_stats;
-	if (s) {
+	if (s)
 		atomic_long_inc(&s->pt_writes[level]);
-		atomic_long_add(mitosis_ring_len(page), &s->pt_pages[level]);
-	}
+}
+
+void mitosis_stats_pt_pages(void *tablep, int level, long pages)
+{
+	struct page *page;
+	struct mm_struct *mm;
+	struct mitosis_stats *s;
+
+	if (!static_branch_unlikely(&mitosis_repl_ever_enabled))
+		return;
+	if (level < 0 || level >= MITOSIS_PT_NR_LEVELS)
+		return;
+	if (!tablep || !virt_addr_valid(tablep))
+		return;
+
+	page = virt_to_page(tablep);
+	if (!pfn_valid(page_to_pfn(page)))
+		return;
+
+	mm = READ_ONCE(page->pt_owner_mm);
+	if (!mm)
+		return;
+
+	s = mm->mitosis_stats;
+	if (s)
+		atomic_long_add(pages, &s->pt_pages[level]);
 }
 
 static const char * const mitosis_level_name[MITOSIS_PT_NR_LEVELS] = {
